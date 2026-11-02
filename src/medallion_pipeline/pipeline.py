@@ -1,0 +1,91 @@
+"""Orchestrates one run: raw -> Bronze -> Silver -> Gold -> quality gate."""
+
+import json
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from pyspark.sql import DataFrame, SparkSession
+
+from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
+from medallion_pipeline.config import LakePaths
+from medallion_pipeline.gold import build_gold, write_gold
+from medallion_pipeline.quality import CheckResult, assert_all_passed, run_checks
+from medallion_pipeline.silver import SilverTables, build_silver, write_silver
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RunResult:
+    batch_id: str
+    row_counts: dict[str, int]
+    checks: list[CheckResult]
+    report_path: Path
+
+
+def default_batch_id() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def count_rows(silver: SilverTables, gold: dict[str, DataFrame]) -> dict[str, int]:
+    counts = {f"silver.{name}": df.count() for name, df in silver.as_dict().items()}
+    counts |= {f"quarantine.{name}": df.count() for name, df in silver.quarantine.items()}
+    counts |= {f"gold.{name}": df.count() for name, df in gold.items()}
+    return counts
+
+
+def write_report(result: RunResult) -> None:
+    result.report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "batch_id": result.batch_id,
+        "row_counts": result.row_counts,
+        "checks": [check.as_dict() for check in result.checks],
+    }
+    result.report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def run_pipeline(spark: SparkSession, paths: LakePaths, batch_id: str | None = None) -> RunResult:
+    """Run every layer, write the report, then fail if the quality gate did not pass.
+
+    Silver is rebuilt from all Bronze batches, so a delivery that repeats earlier records does not
+    create duplicates.
+    """
+    batch_id = batch_id or default_batch_id()
+
+    logger.info("Bronze: ingesting batch %s", batch_id)
+    write_bronze(read_raw(spark, paths, batch_id), paths)
+
+    logger.info("Silver: validating and deduplicating")
+    write_silver(build_silver(read_bronze(spark, paths)), paths)
+    silver = SilverTables(
+        **{
+            name: spark.read.parquet((paths.silver / name).as_posix())
+            for name in ("customers", "products", "orders", "order_items")
+        },
+        quarantine={
+            name: spark.read.parquet((paths.quarantine / name).as_posix())
+            for name in ("customers", "products", "orders", "order_items")
+        },
+    )
+
+    logger.info("Gold: building marts")
+    write_gold(build_gold(silver), paths)
+    gold = {
+        path.name: spark.read.parquet(path.as_posix())
+        for path in sorted(paths.gold.iterdir())
+        if path.is_dir()
+    }
+
+    logger.info("Quality: running checks")
+    result = RunResult(
+        batch_id=batch_id,
+        row_counts=count_rows(silver, gold),
+        checks=run_checks(silver, gold),
+        report_path=paths.reports / f"run_{batch_id}.json",
+    )
+    write_report(result)
+    assert_all_passed(result.checks)
+    logger.info("Run %s finished; report at %s", batch_id, result.report_path)
+    return result

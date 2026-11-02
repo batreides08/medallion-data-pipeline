@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-from medallion_pipeline.config import REVENUE_STATUSES
+from medallion_pipeline.config import ENTITIES, REVENUE_STATUSES
 from medallion_pipeline.silver import SilverTables
 
 
@@ -82,6 +82,37 @@ def run_checks(silver: SilverTables, gold: dict[str, DataFrame]) -> list[CheckRe
             silver.order_items, silver.products, "product_id", "order_items->products"
         ),
         check_revenue_reconciles(silver, gold),
+    ]
+
+
+def rejection_rates(row_counts: dict[str, int]) -> dict[str, float]:
+    """Share of each entity's rows that went to quarantine, from Silver and quarantine counts.
+
+    An entity with no rows at all has a rate of 0.0 rather than an undefined one.
+    """
+    rates = {}
+    for entity in ENTITIES:
+        rejected = row_counts[f"quarantine.{entity}"]
+        total = row_counts[f"silver.{entity}"] + rejected
+        rates[entity] = rejected / total if total else 0.0
+    return rates
+
+
+def check_rejection_rates(rates: dict[str, float], max_rate: float) -> list[CheckResult]:
+    """Fail an entity whose quarantine share is above ``max_rate``.
+
+    A high rate usually means the source changed (a new format, a broken export), not that a few
+    records are bad, so the run should stop instead of publishing a thin Silver layer.
+    """
+    if not 0 <= max_rate <= 1:
+        raise ValueError(f"max_rate must be between 0 and 1, got {max_rate}")
+    return [
+        CheckResult(
+            f"rejection_rate:{entity}",
+            rate <= max_rate,
+            f"{rate:.2%} of rows quarantined (limit {max_rate:.2%})",
+        )
+        for entity, rate in rates.items()
     ]
 
 

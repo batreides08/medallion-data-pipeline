@@ -6,17 +6,17 @@ from pyspark.sql import SparkSession
 
 from medallion_pipeline.bronze import read_raw
 from medallion_pipeline.cli import main
-from medallion_pipeline.config import LakePaths
+from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
 from medallion_pipeline.data_generator import ExpectedCounts, generate_raw_data
 from medallion_pipeline.gold import build_gold
-from medallion_pipeline.pipeline import count_rows, run_pipeline
+from medallion_pipeline.pipeline import batch_row_counts, count_rows, run_pipeline
 from medallion_pipeline.quality import (
     CheckResult,
     DataQualityError,
     assert_all_passed,
     run_checks,
 )
-from medallion_pipeline.silver import build_silver
+from medallion_pipeline.silver import SilverTables, build_silver
 
 
 def _assert_matches_generator(counts: dict[str, int], expected: ExpectedCounts) -> None:
@@ -69,6 +69,14 @@ def test_run_persists_every_layer_and_writes_report(
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
     assert report["batch_id"] == "batch-1"
     assert all(check["passed"] for check in report["checks"])
+    assert report["max_rejection_rate"] == DEFAULT_MAX_REJECTION_RATE
+    total_orders = expected.silver_orders + expected.rejected_orders
+    assert report["batch_rejection_rates"]["orders"] == pytest.approx(
+        expected.rejected_orders / total_orders
+    )
+    assert {c["name"] for c in report["checks"]} >= {
+        f"rejection_rate:{entity}" for entity in ENTITIES
+    }
 
 
 @pytest.mark.parquet_io
@@ -102,6 +110,12 @@ def test_redelivered_data_does_not_duplicate_silver(
     assert result.row_counts["silver.orders"] == expected.silver_orders
     assert result.row_counts["silver.order_items"] == expected.silver_order_items
     assert result.row_counts["silver.customers"] == expected.silver_customers
+    # Quarantine accumulates both deliveries, but the rate only measures the latest one.
+    assert result.row_counts["quarantine.products"] == 2 * expected.rejected_products
+    total_products = expected.silver_products + expected.rejected_products
+    assert result.batch_rejection_rates["products"] == pytest.approx(
+        expected.rejected_products / total_products
+    )
 
 
 @pytest.mark.parquet_io
@@ -123,7 +137,8 @@ def test_failed_quality_gate_still_writes_report(
         run_pipeline(spark, paths, "batch-1")
 
     report = json.loads((paths.reports / "run_batch-1.json").read_text(encoding="utf-8"))
-    assert report["checks"][-1]["passed"] is False
+    checks = {check["name"]: check["passed"] for check in report["checks"]}
+    assert checks["reconciliation:revenue"] is False
 
 
 @pytest.mark.parquet_io
@@ -156,3 +171,56 @@ def test_cli_run_returns_one_when_the_quality_gate_fails(
     monkeypatch.setattr(spark, "stop", lambda: None)
 
     assert main(["run", "--data-dir", str(paths.root)]) == 1
+
+
+@pytest.mark.parquet_io
+def test_rejection_rate_above_the_limit_fails_the_run_and_is_reported(
+    spark: SparkSession, fresh_lake: tuple[LakePaths, ExpectedCounts]
+) -> None:
+    paths, _ = fresh_lake
+
+    # The generator quarantines about 5.7% of products, so a 5% limit must stop the run.
+    with pytest.raises(DataQualityError, match="rejection_rate:products"):
+        run_pipeline(spark, paths, "strict", max_rejection_rate=0.05)
+
+    report = json.loads((paths.reports / "run_strict.json").read_text(encoding="utf-8"))
+    failed = [c["name"] for c in report["checks"] if not c["passed"]]
+    assert failed == ["rejection_rate:products"]
+    assert report["max_rejection_rate"] == 0.05
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "abc"])
+def test_cli_rejects_an_invalid_rejection_rate_limit(tmp_path: Path, value: str) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["run", "--data-dir", str(tmp_path), "--max-rejection-rate", value])
+
+    assert exit_info.value.code == 2
+
+
+def test_batch_row_counts_only_count_the_given_batch(spark: SparkSession) -> None:
+    def frame(*batches: str):
+        return spark.createDataFrame([(b,) for b in batches], "_batch_id string")
+
+    silver = SilverTables(
+        customers=frame("b1", "b2"),
+        products=frame("b1"),
+        orders=frame("b2", "b2"),
+        order_items=frame("b2"),
+        quarantine={
+            "customers": frame("b1"),
+            "products": frame("b1", "b2"),
+            "orders": frame("b1"),
+            "order_items": frame("b2"),
+        },
+    )
+
+    assert batch_row_counts(silver, "b2") == {
+        "silver.customers": 1,
+        "silver.products": 0,
+        "silver.orders": 2,
+        "silver.order_items": 1,
+        "quarantine.customers": 0,
+        "quarantine.products": 1,
+        "quarantine.orders": 0,
+        "quarantine.order_items": 1,
+    }

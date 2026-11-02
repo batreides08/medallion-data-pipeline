@@ -7,11 +7,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 
 from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
-from medallion_pipeline.config import LakePaths
+from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
 from medallion_pipeline.gold import build_gold, write_gold
-from medallion_pipeline.quality import CheckResult, assert_all_passed, run_checks
+from medallion_pipeline.quality import (
+    CheckResult,
+    assert_all_passed,
+    check_rejection_rates,
+    rejection_rates,
+    run_checks,
+)
 from medallion_pipeline.silver import SilverTables, build_silver, write_silver
 
 logger = logging.getLogger(__name__)
@@ -21,6 +28,8 @@ logger = logging.getLogger(__name__)
 class RunResult:
     batch_id: str
     row_counts: dict[str, int]
+    batch_rejection_rates: dict[str, float]
+    max_rejection_rate: float
     checks: list[CheckResult]
     report_path: Path
 
@@ -36,21 +45,46 @@ def count_rows(silver: SilverTables, gold: dict[str, DataFrame]) -> dict[str, in
     return counts
 
 
+def batch_row_counts(silver: SilverTables, batch_id: str) -> dict[str, int]:
+    """Valid and quarantined rows per entity that came from ``batch_id``.
+
+    Quarantine keeps every rejected row from every batch, while Silver keeps one version per key,
+    so rates over the whole lake drift upwards each time data is re-delivered. Counting only the
+    current batch measures the delivery that was just received.
+    """
+    in_batch = F.col("_batch_id") == batch_id
+    counts = {
+        f"silver.{name}": df.filter(in_batch).count() for name, df in silver.as_dict().items()
+    }
+    counts |= {
+        f"quarantine.{name}": df.filter(in_batch).count() for name, df in silver.quarantine.items()
+    }
+    return counts
+
+
 def write_report(result: RunResult) -> None:
     result.report_path.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "batch_id": result.batch_id,
         "row_counts": result.row_counts,
+        "batch_rejection_rates": result.batch_rejection_rates,
+        "max_rejection_rate": result.max_rejection_rate,
         "checks": [check.as_dict() for check in result.checks],
     }
     result.report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
-def run_pipeline(spark: SparkSession, paths: LakePaths, batch_id: str | None = None) -> RunResult:
+def run_pipeline(
+    spark: SparkSession,
+    paths: LakePaths,
+    batch_id: str | None = None,
+    max_rejection_rate: float = DEFAULT_MAX_REJECTION_RATE,
+) -> RunResult:
     """Run every layer, write the report, then fail if the quality gate did not pass.
 
     Silver is rebuilt from all Bronze batches, so a delivery that repeats earlier records does not
-    create duplicates.
+    create duplicates. An entity whose share of quarantined rows in this batch exceeds
+    ``max_rejection_rate`` fails the quality gate.
     """
     batch_id = batch_id or default_batch_id()
 
@@ -60,13 +94,9 @@ def run_pipeline(spark: SparkSession, paths: LakePaths, batch_id: str | None = N
     logger.info("Silver: validating and deduplicating")
     write_silver(build_silver(read_bronze(spark, paths)), paths)
     silver = SilverTables(
-        **{
-            name: spark.read.parquet((paths.silver / name).as_posix())
-            for name in ("customers", "products", "orders", "order_items")
-        },
+        **{name: spark.read.parquet((paths.silver / name).as_posix()) for name in ENTITIES},
         quarantine={
-            name: spark.read.parquet((paths.quarantine / name).as_posix())
-            for name in ("customers", "products", "orders", "order_items")
+            name: spark.read.parquet((paths.quarantine / name).as_posix()) for name in ENTITIES
         },
     )
 
@@ -79,10 +109,14 @@ def run_pipeline(spark: SparkSession, paths: LakePaths, batch_id: str | None = N
     }
 
     logger.info("Quality: running checks")
+    row_counts = count_rows(silver, gold)
+    rates = rejection_rates(batch_row_counts(silver, batch_id))
     result = RunResult(
         batch_id=batch_id,
-        row_counts=count_rows(silver, gold),
-        checks=run_checks(silver, gold),
+        row_counts=row_counts,
+        batch_rejection_rates=rates,
+        max_rejection_rate=max_rejection_rate,
+        checks=[*run_checks(silver, gold), *check_rejection_rates(rates, max_rejection_rate)],
         report_path=paths.reports / f"run_{batch_id}.json",
     )
     write_report(result)

@@ -44,6 +44,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **A quality gate that can stop a run.** It checks primary keys, required fields and references
   between tables, and reconciles revenue across every Gold mart to the cent. The report is written
   even when the gate fails.
+- **Rejection-rate monitoring.** The report records what share of each entity's rows in the batch
+  went to quarantine, and the gate fails when any share is above a limit (10% by default), so a
+  broken delivery cannot quietly publish a half-empty Silver layer.
 - **Verifiable tests.** The generator injects a known number of defects and states how many rows
   each table must end up with, so the tests compare against an independent source of truth.
 - **Synthetic data only.** Everything is produced from a seeded random generator, so results are
@@ -62,6 +65,16 @@ medallion-pipeline run --data-dir data
 ```
 
 The lake is written to `data/`, with a report at `data/reports/run_<batch_id>.json`.
+
+The report holds row counts, the share of each entity's rows in this batch that went to quarantine,
+and every quality check. To change how much quarantine a batch may produce before it fails:
+
+```bash
+medallion-pipeline run --data-dir data --max-rejection-rate 0.05
+```
+
+With the seeded data, about 5.7% of products are rejected, so this example fails on purpose with
+`rejection_rate:products` and exit code 1.
 
 Query the results with any Parquet reader, for example from `pyspark`:
 

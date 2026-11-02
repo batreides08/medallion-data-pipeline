@@ -9,8 +9,10 @@ from medallion_pipeline.quality import (
     assert_all_passed,
     check_not_null,
     check_references,
+    check_rejection_rates,
     check_revenue_reconciles,
     check_unique,
+    rejection_rates,
 )
 from medallion_pipeline.silver import SilverTables
 
@@ -75,3 +77,41 @@ def test_assert_all_passed_names_the_failures() -> None:
 
 def test_assert_all_passed_accepts_clean_results() -> None:
     assert_all_passed([CheckResult("good", True, "")])
+
+
+def _counts(**rejected: int) -> dict[str, int]:
+    """Row counts with 90 valid rows per entity and the given number of rejected ones."""
+    counts = {}
+    for entity in ("customers", "products", "orders", "order_items"):
+        counts[f"silver.{entity}"] = 90
+        counts[f"quarantine.{entity}"] = rejected.get(entity, 0)
+    return counts
+
+
+def test_rejection_rates_are_the_quarantined_share_of_each_entity() -> None:
+    rates = rejection_rates(_counts(customers=10, orders=30))
+
+    assert rates == {"customers": 0.1, "products": 0.0, "orders": 0.25, "order_items": 0.0}
+
+
+def test_rejection_rate_of_an_empty_entity_is_zero() -> None:
+    counts = _counts()
+    counts["silver.products"] = 0
+
+    assert rejection_rates(counts)["products"] == 0.0
+
+
+def test_rejection_rate_check_fails_only_the_entity_above_the_limit() -> None:
+    results = check_rejection_rates({"customers": 0.10, "orders": 0.25}, max_rate=0.10)
+
+    assert [(r.name, r.passed) for r in results] == [
+        ("rejection_rate:customers", True),
+        ("rejection_rate:orders", False),
+    ]
+    assert results[1].detail == "25.00% of rows quarantined (limit 10.00%)"
+
+
+@pytest.mark.parametrize("max_rate", [-0.01, 1.01])
+def test_rejection_rate_limit_must_be_a_fraction(max_rate: float) -> None:
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        check_rejection_rates({"orders": 0.0}, max_rate)

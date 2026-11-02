@@ -10,8 +10,16 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
-from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
+from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.gold import build_gold, write_gold
+from medallion_pipeline.incremental import (
+    bronze_batches,
+    merge_silver,
+    read_silver,
+    read_watermark,
+    write_silver_merged,
+    write_watermark,
+)
 from medallion_pipeline.quality import (
     CheckResult,
     assert_all_passed,
@@ -79,26 +87,35 @@ def run_pipeline(
     paths: LakePaths,
     batch_id: str | None = None,
     max_rejection_rate: float = DEFAULT_MAX_REJECTION_RATE,
+    incremental: bool = False,
 ) -> RunResult:
     """Run every layer, write the report, then fail if the quality gate did not pass.
 
     Silver is rebuilt from all Bronze batches, so a delivery that repeats earlier records does not
     create duplicates. An entity whose share of quarantined rows in this batch exceeds
     ``max_rejection_rate`` fails the quality gate.
+
+    With ``incremental=True`` only Bronze batches missing from the watermark (plus ``batch_id``
+    itself, so a replay is merged again) are cleaned and merged into the existing Silver tables.
+    The first incremental run, which has no watermark, performs a full rebuild.
     """
     batch_id = batch_id or default_batch_id()
 
     logger.info("Bronze: ingesting batch %s", batch_id)
     write_bronze(read_raw(spark, paths, batch_id), paths)
 
-    logger.info("Silver: validating and deduplicating")
-    write_silver(build_silver(read_bronze(spark, paths)), paths)
-    silver = SilverTables(
-        **{name: spark.read.parquet((paths.silver / name).as_posix()) for name in ENTITIES},
-        quarantine={
-            name: spark.read.parquet((paths.quarantine / name).as_posix()) for name in ENTITIES
-        },
-    )
+    bronze = read_bronze(spark, paths)
+    all_batches = bronze_batches(bronze)
+    processed = read_watermark(paths)
+    if incremental and processed:
+        new_batches = (all_batches - processed) | {batch_id}
+        logger.info("Silver: merging batches %s", sorted(new_batches))
+        write_silver_merged(merge_silver(read_silver(spark, paths), bronze, new_batches), paths)
+    else:
+        logger.info("Silver: validating and deduplicating all batches")
+        write_silver(build_silver(bronze), paths)
+    write_watermark(paths, all_batches)
+    silver = read_silver(spark, paths)
 
     logger.info("Gold: building marts")
     write_gold(build_gold(silver), paths)

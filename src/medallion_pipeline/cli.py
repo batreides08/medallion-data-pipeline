@@ -40,6 +40,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_REJECTION_RATE,
         help="fail the run if more than this share of any entity is quarantined (0 to 1)",
     )
+    run.add_argument(
+        "--incremental",
+        action="store_true",
+        help="merge only batches not yet in the watermark instead of rebuilding Silver",
+    )
     return parser
 
 
@@ -59,7 +64,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spark = create_spark_session()
     try:
-        result = run_pipeline(spark, paths, args.batch_id, args.max_rejection_rate)
+        result = run_pipeline(
+            spark, paths, args.batch_id, args.max_rejection_rate, args.incremental
+        )
     except DataQualityError as error:
         logging.error("%s", error)
         return 1

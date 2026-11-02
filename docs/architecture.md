@@ -66,7 +66,21 @@ flowchart TD
 | `order_items` | `order_id`, `line_number` | Known product, positive quantity, non-negative price. |
 
 A rule that evaluates to NULL counts as broken. Silver is rebuilt from every Bronze batch on each
-run.
+run unless `--incremental` is used.
+
+### Incremental loading
+
+`state/watermark.json` lists the Bronze batches already merged into Silver. An incremental run
+cleans only the missing batches (plus the current one, so a replay is merged again) and merges
+them into the existing tables with the same rules as a full rebuild: newest `updated_at` wins for
+customers and products, newest ingestion wins for orders, and a re-delivered order replaces its
+lines. Quarantine rows of a replayed batch are replaced, not duplicated. Merged tables are written
+to `state/staging` and swapped in, because Spark cannot overwrite a path it is reading.
+
+Known limits: an order rejected earlier for an unknown customer is not re-evaluated when that
+customer arrives in a later batch (a full rebuild would accept it), and a record that disappears
+from a replayed batch stays in Silver. Atomic publishing (issue #8) is the planned fix for
+partial writes.
 
 A rejected line does not reject its order. The order stays valid and only the line moves to
 quarantine, because the rest of the sale really happened.
@@ -107,7 +121,7 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 | Decision | Why | Trade-off |
 | --- | --- | --- |
 | Pure transformations separated from I/O | Almost all logic can be tested without touching disk | `pipeline.py` has to wire reads and writes explicitly |
-| Full Silver rebuild on each run | Simple, and correct by construction when data is repeated | Cost grows with history; incremental loading is on the roadmap |
+| Full Silver rebuild by default, optional watermark-based merge | Rebuild is correct by construction; the merge keeps cost proportional to the delivery | The merge has the limits listed under Incremental loading |
 | Quarantine tables rather than dropping or failing | Keeps evidence and lets valid data flow | Quarantine needs monitoring, done by the rejection-rate check |
 | Rejection rate per batch, with one limit for every entity | Measures the delivery just received and stays simple to reason about | A record re-delivered with an older version than Silver holds counts in neither side of the rate |
 | Gold in `.sql` files | Business logic stays readable by analysts and reviewable on its own | Requires a small templating step for shared constants |

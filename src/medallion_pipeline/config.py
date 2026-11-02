@@ -6,6 +6,12 @@ from pathlib import Path
 ORDER_STATUSES = ("placed", "shipped", "delivered", "cancelled", "returned")
 REVENUE_STATUSES = ("placed", "shipped", "delivered")
 
+# Share of an entity's rows that may land in quarantine before the run is failed. The seeded
+# generator rejects at most about 6% of any table, so 10% leaves room for normal defects while
+# still stopping a delivery that is broken across the board.
+DEFAULT_MAX_REJECTION_RATE = 0.10
+ENTITIES = ("customers", "products", "orders", "order_items")
+
 
 @dataclass(frozen=True)
 class LakePaths:

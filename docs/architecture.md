@@ -91,6 +91,13 @@ After Gold is built, the gate checks:
 - Referential integrity between Silver tables.
 - Reconciliation: the three marts and the Silver lines report the same revenue, using exact decimal
   arithmetic.
+- Rejection rate: for each entity, the share of this batch's rows that went to quarantine must not
+  exceed `--max-rejection-rate` (default 10%). The rates are written to the report as
+  `batch_rejection_rates`.
+
+The rejection rate counts only rows whose `_batch_id` is the current batch. Quarantine keeps every
+rejected row ever delivered, while Silver keeps one version per key, so a rate over the whole lake
+would rise every time data is re-delivered and eventually fail a healthy run.
 
 The report is written first, so a failed run still leaves evidence. The pipeline then raises
 `DataQualityError` and the command exits with a non-zero code.
@@ -101,13 +108,17 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 | --- | --- | --- |
 | Pure transformations separated from I/O | Almost all logic can be tested without touching disk | `pipeline.py` has to wire reads and writes explicitly |
 | Full Silver rebuild on each run | Simple, and correct by construction when data is repeated | Cost grows with history; incremental loading is on the roadmap |
-| Quarantine tables rather than dropping or failing | Keeps evidence and lets valid data flow | Quarantine needs monitoring |
+| Quarantine tables rather than dropping or failing | Keeps evidence and lets valid data flow | Quarantine needs monitoring, done by the rejection-rate check |
+| Rejection rate per batch, with one limit for every entity | Measures the delivery just received and stays simple to reason about | A record re-delivered with an older version than Silver holds counts in neither side of the rate |
 | Gold in `.sql` files | Business logic stays readable by analysts and reviewable on its own | Requires a small templating step for shared constants |
 | Parquet rather than Delta Lake | No extra dependency for the first version | No ACID guarantees or time travel yet |
 | Synthetic data | Reproducible, free of private data, and defects are known exactly | Volumes and distributions are not those of a real business |
 | Generator states expected counts | Tests compare with a source independent of the code under test | The generator has to be kept in sync when defects are added |
 
 ## Known limitations
+
+- Rejection rates are recorded per run but not yet compared across runs, so a slow drift below the
+  limit is not flagged. A history of run reports would make that possible.
 
 - A run overwrites Silver and Gold in place, so a crash mid-write can leave a layer partly written.
 - Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.

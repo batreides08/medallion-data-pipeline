@@ -42,3 +42,7 @@ class LakePaths:
     @property
     def reports(self) -> Path:
         return self.root / "reports"
+
+    @property
+    def state(self) -> Path:
+        return self.root / "state"

@@ -40,7 +40,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Quarantine instead of data loss.** Rows that break a rule are stored with the name of every
   rule they broke. Malformed JSON is kept verbatim.
 - **Idempotent runs.** Re-running a batch replaces only that batch, and Silver is rebuilt from all
-  of Bronze, so repeated deliveries do not create duplicates.
+  of Bronze by default, so repeated deliveries do not create duplicates. With `--incremental`,
+  only batches missing from a watermark file (`state/watermark.json`) are cleaned and merged into
+  Silver; a test checks the result equals a full rebuild.
 - **A quality gate that can stop a run.** It checks primary keys, required fields and references
   between tables, and reconciles revenue across every Gold mart to the cent. The report is written
   even when the gate fails.
@@ -71,6 +73,9 @@ and every quality check. To change how much quarantine a batch may produce befor
 
 ```bash
 medallion-pipeline run --data-dir data --max-rejection-rate 0.05
+
+# Merge only batches not yet processed (first run falls back to a full build)
+medallion-pipeline run --data-dir data --incremental
 ```
 
 With the seeded data, about 5.7% of products are rejected, so this example fails on purpose with

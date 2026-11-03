@@ -67,7 +67,8 @@ def keep_latest(df: DataFrame, key: str, *newest_first: Column) -> DataFrame:
     )
 
 
-def clean_customers(bronze: DataFrame) -> Split:
+def validate_customers(bronze: DataFrame) -> Split:
+    """Type and validate customer rows, keeping every version (no deduplication)."""
     typed = bronze.select(
         F.trim("customer_id").alias("customer_id"),
         F.trim("full_name").alias("full_name"),
@@ -84,6 +85,11 @@ def clean_customers(bronze: DataFrame) -> Split:
             "updated_at_parsable": F.col("updated_at").isNotNull(),
         },
     )
+    return split
+
+
+def clean_customers(bronze: DataFrame) -> Split:
+    split = validate_customers(bronze)
     latest = keep_latest(
         split.valid, "customer_id", F.col("updated_at").desc(), F.col("_ingested_at").desc()
     )

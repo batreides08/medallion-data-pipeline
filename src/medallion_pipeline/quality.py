@@ -85,6 +85,34 @@ def run_checks(silver: SilverTables, gold: dict[str, DataFrame]) -> list[CheckRe
     ]
 
 
+def check_scd2(
+    silver: SilverTables, dim_customer: DataFrame, order_versions: DataFrame
+) -> list[CheckResult]:
+    """Integrity of the customer history: one open version per customer, no order left unmatched."""
+    open_versions = dim_customer.filter(F.col("is_current"))
+    current = check_unique(open_versions, "gold.dim_customer(current)", "customer_id")
+    missing = (
+        silver.customers.select("customer_id")
+        .distinct()
+        .join(open_versions, "customer_id", "left_anti")
+    ).count()
+    unmatched = order_versions.filter(F.col("customer_key").isNull()).count()
+    return [
+        current,
+        check_unique(dim_customer, "gold.dim_customer", "customer_id", "valid_from"),
+        CheckResult(
+            "scd2:every_customer_has_current_version", missing == 0, f"{missing} without one"
+        ),
+        check_unique(order_versions, "gold.order_customer_version", "order_id"),
+        CheckResult(
+            "scd2:orders_matched_to_version", unmatched == 0, f"{unmatched} unmatched order(s)"
+        ),
+        check_references(
+            order_versions, silver.orders, "order_id", "order_customer_version->orders"
+        ),
+    ]
+
+
 def rejection_rates(row_counts: dict[str, int]) -> dict[str, float]:
     """Share of each entity's rows that went to quarantine, from Silver and quarantine counts.
 

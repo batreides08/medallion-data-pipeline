@@ -24,9 +24,11 @@ from medallion_pipeline.quality import (
     CheckResult,
     assert_all_passed,
     check_rejection_rates,
+    check_scd2,
     rejection_rates,
     run_checks,
 )
+from medallion_pipeline.scd2 import build_dim_customer, orders_with_customer_version, write_scd2
 from medallion_pipeline.silver import SilverTables, build_silver, write_silver
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,10 @@ def run_pipeline(
 
     logger.info("Gold: building marts")
     write_gold(build_gold(silver), paths)
+    logger.info("Gold: building customer history (SCD Type 2)")
+    dim_customer = build_dim_customer(bronze["customers"])
+    order_versions = orders_with_customer_version(silver.orders, dim_customer)
+    write_scd2(dim_customer, order_versions, paths)
     gold = {
         path.name: spark.read.parquet(path.as_posix())
         for path in sorted(paths.gold.iterdir())
@@ -133,7 +139,11 @@ def run_pipeline(
         row_counts=row_counts,
         batch_rejection_rates=rates,
         max_rejection_rate=max_rejection_rate,
-        checks=[*run_checks(silver, gold), *check_rejection_rates(rates, max_rejection_rate)],
+        checks=[
+            *run_checks(silver, gold),
+            *check_scd2(silver, gold["dim_customer"], gold["order_customer_version"]),
+            *check_rejection_rates(rates, max_rejection_rate),
+        ],
         report_path=paths.reports / f"run_{batch_id}.json",
     )
     write_report(result)

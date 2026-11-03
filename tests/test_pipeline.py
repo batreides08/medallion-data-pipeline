@@ -77,6 +77,10 @@ def test_run_persists_every_layer_and_writes_report(
     assert {c["name"] for c in report["checks"]} >= {
         f"rejection_rate:{entity}" for entity in ENTITIES
     }
+    names = {c["name"] for c in report["checks"]}
+    assert {"scd2:orders_matched_to_version", "unique:gold.dim_customer"} <= names
+    assert result.row_counts["gold.dim_customer"] >= expected.silver_customers
+    assert result.row_counts["gold.order_customer_version"] == expected.silver_orders
 
 
 @pytest.mark.parquet_io

@@ -96,6 +96,20 @@ quarantine, because the rest of the sale really happened.
 Revenue is recognised for orders that are `placed`, `shipped` or `delivered`. Orders that were
 `cancelled` or `returned` are excluded.
 
+### Customer history (SCD Type 2)
+
+Silver keeps one row per customer, so `scd2.py` rebuilds the history from the valid customer rows
+in Bronze (the same rules, without deduplication). `gold/dim_customer` has one row per version:
+`customer_key`, `customer_id`, `full_name`, `email`, `country`, `version_number`, `valid_from`,
+`valid_to` (NULL while current) and `is_current`. A new version is created only when a tracked
+attribute changes; the same instant delivered twice keeps the latest ingestion.
+`gold/order_customer_version` gives, per order, the attributes valid at `order_ts`. An order placed
+before the first known version takes that first version. The quality gate checks one current
+version per customer, unique `(customer_id, valid_from)` and that every order matches a version.
+
+Limit: the dimension is recomputed from all of Bronze on each run, which is cheap for a customer
+table but does not follow the watermark.
+
 ## Quality gate
 
 After Gold is built, the gate checks:

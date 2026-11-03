@@ -49,6 +49,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Rejection-rate monitoring.** The report records what share of each entity's rows in the batch
   went to quarantine, and the gate fails when any share is above a limit (10% by default), so a
   broken delivery cannot quietly publish a half-empty Silver layer.
+- **Customer history (SCD Type 2).** `gold/dim_customer` keeps every version of a customer with a
+  `[valid_from, valid_to)` range, and `gold/order_customer_version` joins each order to the version
+  valid when it was placed. Only attribute changes create a version.
 - **Verifiable tests.** The generator injects a known number of defects and states how many rows
   each table must end up with, so the tests compare against an independent source of truth.
 - **Synthetic data only.** Everything is produced from a seeded random generator, so results are
@@ -118,6 +121,7 @@ src/medallion_pipeline/
 ├── data_generator.py   Seeded raw data with known defects
 ├── bronze.py           Raw ingestion with lineage
 ├── silver.py           Typing, validation, deduplication, quarantine
+├── scd2.py             Customer history (dim_customer) and point-in-time order join
 ├── gold.py             Runs the SQL marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate

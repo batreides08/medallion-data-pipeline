@@ -49,6 +49,10 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Rejection-rate monitoring.** The report records what share of each entity's rows in the batch
   went to quarantine, and the gate fails when any share is above a limit (10% by default), so a
   broken delivery cannot quietly publish a half-empty Silver layer.
+- **Run history and trend check.** Every run appends its row counts, rejection rates and outcome to
+  `state/run_history.jsonl`. Once three passing runs exist, the gate also fails an entity whose
+  rejection rate is more than 5 points above the median of recent passing runs, which catches a
+  drift that is still under the absolute limit.
 - **Customer history (SCD Type 2).** `gold/dim_customer` keeps every version of a customer with a
   `[valid_from, valid_to)` range, and `gold/order_customer_version` joins each order to the version
   valid when it was placed. Only attribute changes create a version.

@@ -12,6 +12,7 @@ from pyspark.sql import functions as F
 from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.gold import build_gold, write_gold
+from medallion_pipeline.history import append_run, check_rejection_trend, read_history
 from medallion_pipeline.incremental import (
     bronze_batches,
     merge_silver,
@@ -143,10 +144,12 @@ def run_pipeline(
             *run_checks(silver, gold),
             *check_scd2(silver, gold["dim_customer"], gold["order_customer_version"]),
             *check_rejection_rates(rates, max_rejection_rate),
+            *check_rejection_trend(rates, read_history(paths)),
         ],
         report_path=paths.reports / f"run_{batch_id}.json",
     )
     write_report(result)
+    append_run(paths, batch_id, row_counts, rates, all(c.passed for c in result.checks))
     assert_all_passed(result.checks)
     logger.info("Run %s finished; report at %s", batch_id, result.report_path)
     return result

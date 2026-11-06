@@ -2,9 +2,10 @@
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -21,8 +22,10 @@ from medallion_pipeline.incremental import (
     write_silver_merged,
     write_watermark,
 )
+from medallion_pipeline.orchestrator import RetryPolicy, Task, run_tasks
 from medallion_pipeline.quality import (
     CheckResult,
+    DataQualityError,
     assert_all_passed,
     check_rejection_rates,
     check_scd2,
@@ -43,6 +46,7 @@ class RunResult:
     max_rejection_rate: float
     checks: list[CheckResult]
     report_path: Path
+    task_attempts: dict[str, int] = field(default_factory=dict)
 
 
 def default_batch_id() -> str:
@@ -91,8 +95,9 @@ def run_pipeline(
     batch_id: str | None = None,
     max_rejection_rate: float = DEFAULT_MAX_REJECTION_RATE,
     incremental: bool = False,
+    retry_policy: RetryPolicy = RetryPolicy(),  # noqa: B008 - frozen, safe as a default
 ) -> RunResult:
-    """Run every layer, write the report, then fail if the quality gate did not pass.
+    """Run every layer as its own retryable task, write the report, then enforce the gate.
 
     Silver is rebuilt from all Bronze batches, so a delivery that repeats earlier records does not
     create duplicates. An entity whose share of quarantined rows in this batch exceeds
@@ -101,55 +106,78 @@ def run_pipeline(
     With ``incremental=True`` only Bronze batches missing from the watermark (plus ``batch_id``
     itself, so a replay is merged again) are cleaned and merged into the existing Silver tables.
     The first incremental run, which has no watermark, performs a full rebuild.
+
+    Each layer (bronze, silver, gold, quality) is a task retried according to ``retry_policy``.
+    Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
+    retried because running the same checks again cannot change the outcome.
     """
     batch_id = batch_id or default_batch_id()
+    state: dict[str, Any] = {}
 
-    logger.info("Bronze: ingesting batch %s", batch_id)
-    write_bronze(read_raw(spark, paths, batch_id), paths)
+    def bronze_task() -> None:
+        logger.info("Bronze: ingesting batch %s", batch_id)
+        write_bronze(read_raw(spark, paths, batch_id), paths)
+        state["bronze"] = read_bronze(spark, paths)
+        state["all_batches"] = bronze_batches(state["bronze"])
 
-    bronze = read_bronze(spark, paths)
-    all_batches = bronze_batches(bronze)
-    processed = read_watermark(paths)
-    if incremental and processed:
-        new_batches = (all_batches - processed) | {batch_id}
-        logger.info("Silver: merging batches %s", sorted(new_batches))
-        write_silver_merged(merge_silver(read_silver(spark, paths), bronze, new_batches), paths)
-    else:
-        logger.info("Silver: validating and deduplicating all batches")
-        write_silver(build_silver(bronze), paths)
-    write_watermark(paths, all_batches)
-    silver = read_silver(spark, paths)
+    def silver_task() -> None:
+        bronze = state["bronze"]
+        processed = read_watermark(paths)
+        if incremental and processed:
+            new_batches = (state["all_batches"] - processed) | {batch_id}
+            logger.info("Silver: merging batches %s", sorted(new_batches))
+            write_silver_merged(merge_silver(read_silver(spark, paths), bronze, new_batches), paths)
+        else:
+            logger.info("Silver: validating and deduplicating all batches")
+            write_silver(build_silver(bronze), paths)
+        write_watermark(paths, state["all_batches"])
+        state["silver"] = read_silver(spark, paths)
 
-    logger.info("Gold: building marts")
-    write_gold(build_gold(silver), paths)
-    logger.info("Gold: building customer history (SCD Type 2)")
-    dim_customer = build_dim_customer(bronze["customers"])
-    order_versions = orders_with_customer_version(silver.orders, dim_customer)
-    write_scd2(dim_customer, order_versions, paths)
-    gold = {
-        path.name: spark.read.parquet(path.as_posix())
-        for path in sorted(paths.gold.iterdir())
-        if path.is_dir()
-    }
+    def gold_task() -> None:
+        logger.info("Gold: building marts")
+        write_gold(build_gold(state["silver"]), paths)
+        logger.info("Gold: building customer history (SCD Type 2)")
+        dim_customer = build_dim_customer(state["bronze"]["customers"])
+        order_versions = orders_with_customer_version(state["silver"].orders, dim_customer)
+        write_scd2(dim_customer, order_versions, paths)
+        state["gold"] = {
+            path.name: spark.read.parquet(path.as_posix())
+            for path in sorted(paths.gold.iterdir())
+            if path.is_dir()
+        }
 
-    logger.info("Quality: running checks")
-    row_counts = count_rows(silver, gold)
-    rates = rejection_rates(batch_row_counts(silver, batch_id))
-    result = RunResult(
-        batch_id=batch_id,
-        row_counts=row_counts,
-        batch_rejection_rates=rates,
-        max_rejection_rate=max_rejection_rate,
-        checks=[
-            *run_checks(silver, gold),
-            *check_scd2(silver, gold["dim_customer"], gold["order_customer_version"]),
-            *check_rejection_rates(rates, max_rejection_rate),
-            *check_rejection_trend(rates, read_history(paths)),
+    def quality_task() -> None:
+        logger.info("Quality: running checks")
+        silver, gold = state["silver"], state["gold"]
+        row_counts = count_rows(silver, gold)
+        rates = rejection_rates(batch_row_counts(silver, batch_id))
+        result = RunResult(
+            batch_id=batch_id,
+            row_counts=row_counts,
+            batch_rejection_rates=rates,
+            max_rejection_rate=max_rejection_rate,
+            checks=[
+                *run_checks(silver, gold),
+                *check_scd2(silver, gold["dim_customer"], gold["order_customer_version"]),
+                *check_rejection_rates(rates, max_rejection_rate),
+                *check_rejection_trend(rates, read_history(paths)),
+            ],
+            report_path=paths.reports / f"run_{batch_id}.json",
+        )
+        write_report(result)
+        append_run(paths, batch_id, row_counts, rates, all(c.passed for c in result.checks))
+        state["result"] = result
+        assert_all_passed(result.checks)
+
+    attempts = run_tasks(
+        [
+            Task("bronze", bronze_task),
+            Task("silver", silver_task),
+            Task("gold", gold_task),
+            Task("quality", quality_task, no_retry=(DataQualityError,)),
         ],
-        report_path=paths.reports / f"run_{batch_id}.json",
+        retry_policy,
     )
-    write_report(result)
-    append_run(paths, batch_id, row_counts, rates, all(c.passed for c in result.checks))
-    assert_all_passed(result.checks)
+    result = replace(state["result"], task_attempts=attempts)
     logger.info("Run %s finished; report at %s", batch_id, result.report_path)
     return result

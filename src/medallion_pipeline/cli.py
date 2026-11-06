@@ -8,6 +8,7 @@ from pathlib import Path
 
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.data_generator import GenerationConfig, generate_raw_data
+from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import run_pipeline
 from medallion_pipeline.quality import DataQualityError
 from medallion_pipeline.spark import create_spark_session
@@ -20,6 +21,16 @@ def _fraction(value: str) -> float:
         raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
     if not 0 <= number <= 1:
         raise argparse.ArgumentTypeError(f"{value} is not between 0 and 1")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"{value} is negative")
     return number
 
 
@@ -45,6 +56,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="merge only batches not yet in the watermark instead of rebuilding Silver",
     )
+    run.add_argument(
+        "--retries",
+        type=_non_negative_int,
+        default=0,
+        help="retry a failing layer this many times with exponential backoff (default: 0)",
+    )
+    run.add_argument(
+        "--retry-delay",
+        type=float,
+        default=2.0,
+        help="seconds to wait before the first retry; doubles after each one (default: 2)",
+    )
     return parser
 
 
@@ -65,7 +88,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     spark = create_spark_session()
     try:
         result = run_pipeline(
-            spark, paths, args.batch_id, args.max_rejection_rate, args.incremental
+            spark,
+            paths,
+            args.batch_id,
+            args.max_rejection_rate,
+            args.incremental,
+            RetryPolicy(args.retries, max(args.retry_delay, 0.0)),
         )
     except DataQualityError as error:
         logging.error("%s", error)

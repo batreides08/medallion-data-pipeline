@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
+from medallion_pipeline.dashboard import build_dashboard
 from medallion_pipeline.data_generator import GenerationConfig, generate_raw_data
 from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import run_pipeline
@@ -68,6 +69,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="seconds to wait before the first retry; doubles after each one (default: 2)",
     )
+
+    dashboard = commands.add_parser(
+        "dashboard", help="render an HTML dashboard from the Gold marts"
+    )
+    dashboard.add_argument("--data-dir", type=Path, default=Path("data"))
+    dashboard.add_argument(
+        "--output", type=Path, help="defaults to <data-dir>/dashboard/index.html"
+    )
     return parser
 
 
@@ -79,6 +88,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "generate":
         expected = generate_raw_data(paths.raw, GenerationConfig(seed=args.seed))
         logging.info("Raw data written to %s; expected counts: %s", paths.raw, asdict(expected))
+        return 0
+
+    if args.command == "dashboard":
+        if not (paths.gold / "daily_revenue").exists():
+            logging.error("No Gold data in %s; run the run command first", paths.gold)
+            return 2
+        spark = create_spark_session()
+        try:
+            logging.info("Dashboard written to %s", build_dashboard(spark, paths, args.output))
+        finally:
+            spark.stop()
         return 0
 
     if not (paths.raw / "orders.jsonl").exists():

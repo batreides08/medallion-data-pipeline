@@ -56,6 +56,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Customer history (SCD Type 2).** `gold/dim_customer` keeps every version of a customer with a
   `[valid_from, valid_to)` range, and `gold/order_customer_version` joins each order to the version
   valid when it was placed. Only attribute changes create a version.
+- **Static BI dashboard.** `medallion-pipeline dashboard` renders the Gold marts (revenue trend,
+  customer value segments, lifetime revenue by country, category and top-product revenue) as one
+  self-contained HTML page with inline SVG, with no JavaScript, paid tools or external assets.
 - **Verifiable tests.** The generator injects a known number of defects and states how many rows
   each table must end up with, so the tests compare against an independent source of truth.
 - **Synthetic data only.** Everything is produced from a seeded random generator, so results are
@@ -87,6 +90,12 @@ medallion-pipeline run --data-dir data --incremental
 
 With the seeded data, about 5.7% of products are rejected, so this example fails on purpose with
 `rejection_rate:products` and exit code 1.
+
+Render the dashboard from the Gold marts and open `data/dashboard/index.html`:
+
+```bash
+medallion-pipeline dashboard --data-dir data
+```
 
 Query the results with any Parquet reader, for example from `pyspark`:
 
@@ -127,10 +136,11 @@ src/medallion_pipeline/
 ├── silver.py           Typing, validation, deduplication, quarantine
 ├── scd2.py             Customer history (dim_customer) and point-in-time order join
 ├── gold.py             Runs the SQL marts
+├── dashboard.py        Static HTML dashboard over the Gold marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate
 ├── pipeline.py         Orchestrates one run
-└── cli.py              generate and run commands
+└── cli.py              generate, run and dashboard commands
 tests/                  Unit and end-to-end tests
 docs/architecture.md    Design decisions and data model
 ```

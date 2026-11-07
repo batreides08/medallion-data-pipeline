@@ -53,6 +53,12 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   `state/run_history.jsonl`. Once three passing runs exist, the gate also fails an entity whose
   rejection rate is more than 5 points above the median of recent passing runs, which catches a
   drift that is still under the absolute limit.
+- **Layer tasks with retries.** Bronze, Silver, Gold and the quality gate each run as their own
+  task. `--retries N --retry-delay S` retries a failing layer with exponential backoff, while a
+  failed quality gate is never retried. The orchestrator is a small standard-library module
+  (`orchestrator.py`) rather than Airflow or Prefect: the chain is linear and single-machine, so a
+  scheduler service would add moving parts without benefit. Schedule it with any free tool, for
+  example cron: `0 2 * * * medallion-pipeline run --incremental --retries 2`.
 - **Customer history (SCD Type 2).** `gold/dim_customer` keeps every version of a customer with a
   `[valid_from, valid_to)` range, and `gold/order_customer_version` joins each order to the version
   valid when it was placed. Only attribute changes create a version.
@@ -139,7 +145,8 @@ src/medallion_pipeline/
 ├── dashboard.py        Static HTML dashboard over the Gold marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate
-├── pipeline.py         Orchestrates one run
+├── orchestrator.py     Task runner with per-task retries and backoff
+├── pipeline.py         Defines the layer tasks of one run
 └── cli.py              generate, run and dashboard commands
 tests/                  Unit and end-to-end tests
 docs/architecture.md    Design decisions and data model

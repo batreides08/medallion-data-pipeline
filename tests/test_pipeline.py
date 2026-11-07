@@ -4,11 +4,13 @@ from pathlib import Path
 import pytest
 from pyspark.sql import SparkSession
 
+from medallion_pipeline import pipeline
 from medallion_pipeline.bronze import read_raw
 from medallion_pipeline.cli import main
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
 from medallion_pipeline.data_generator import ExpectedCounts, generate_raw_data
 from medallion_pipeline.gold import build_gold
+from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import batch_row_counts, count_rows, run_pipeline
 from medallion_pipeline.quality import (
     CheckResult,
@@ -228,3 +230,43 @@ def test_batch_row_counts_only_count_the_given_batch(spark: SparkSession) -> Non
         "quarantine.orders": 0,
         "quarantine.order_items": 1,
     }
+
+
+@pytest.mark.parquet_io
+def test_transient_failure_in_a_layer_is_retried(
+    spark: SparkSession,
+    fresh_lake: tuple[LakePaths, ExpectedCounts],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, expected = fresh_lake
+    real_write_gold = pipeline.write_gold
+    calls = 0
+
+    def flaky_write_gold(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transient storage error")
+        return real_write_gold(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "write_gold", flaky_write_gold)
+
+    result = run_pipeline(spark, paths, "batch-1", retry_policy=RetryPolicy(1, 0))
+
+    assert result.task_attempts == {"bronze": 1, "silver": 1, "gold": 2, "quality": 1}
+    _assert_matches_generator(result.row_counts, expected)
+
+
+@pytest.mark.parquet_io
+def test_failed_quality_gate_is_not_retried(
+    spark: SparkSession, fresh_lake: tuple[LakePaths, ExpectedCounts]
+) -> None:
+    paths, _ = fresh_lake
+
+    with pytest.raises(DataQualityError):
+        run_pipeline(
+            spark, paths, "batch-1", max_rejection_rate=0.0, retry_policy=RetryPolicy(3, 0)
+        )
+
+    history = (paths.state / "run_history.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(history) == 1

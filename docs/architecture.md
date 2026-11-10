@@ -80,7 +80,7 @@ to `state/staging` and swapped in, because Spark cannot overwrite a path it is r
 Known limits: an order rejected earlier for an unknown customer is not re-evaluated when that
 customer arrives in a later batch (a full rebuild would accept it), and a record that disappears
 from a replayed batch stays in Silver. Atomic publishing (issue #8) is the planned fix for
-partial writes.
+partial writes (now addressed by atomic publishing, see Orchestration).
 
 A rejected line does not reject its order. The order stays valid and only the line moves to
 quarantine, because the rest of the sale really happened.
@@ -118,6 +118,14 @@ attempt counts are stored in the run result. A failed quality gate (`DataQuality
 retried, because repeating the same checks cannot change the outcome. A standard-library runner was
 chosen over Airflow or Prefect because the chain is linear and single-machine; any scheduler, such
 as cron, can invoke the CLI.
+
+### Atomic publishing
+
+Silver and Gold are Delta tables. `silver_task` and `gold_task` write to `state/candidate`, the
+quality gate checks those tables, and `publish_task` copies them over the live tables, one Delta
+commit per table. If the gate fails, `publish` never runs: live tables, their versions and the
+watermark stay as they were. Earlier versions are read with `versionAsOf`
+(`tables.read_table(..., version=n)`).
 
 ### Dashboard
 
@@ -161,7 +169,8 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 | Quarantine tables rather than dropping or failing | Keeps evidence and lets valid data flow | Quarantine needs monitoring, done by the rejection-rate check |
 | Rejection rate per batch, with one limit for every entity | Measures the delivery just received and stays simple to reason about | A record re-delivered with an older version than Silver holds counts in neither side of the rate |
 | Gold in `.sql` files | Business logic stays readable by analysts and reviewable on its own | Requires a small templating step for shared constants |
-| Parquet rather than Delta Lake | No extra dependency for the first version | No ACID guarantees or time travel yet |
+| Delta Lake for Silver, Quarantine and Gold; Parquet for Bronze | ACID commits, time travel, and overwriting a table that is being read | One extra dependency, pinned to a Spark version it supports; Bronze keeps plain Parquet because it is append-only raw data |
+| Build in a candidate lake, publish after the gate | A failed gate never changes live data | Data is written twice, and a publish is one commit per table, not one for the whole lake |
 | Synthetic data | Reproducible, free of private data, and defects are known exactly | Volumes and distributions are not those of a real business |
 | Generator states expected counts | Tests compare with a source independent of the code under test | The generator has to be kept in sync when defects are added |
 
@@ -169,7 +178,11 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 
 - The trend check needs three earlier passing runs and compares against a median, so a slow drift
   across more than 20 runs becomes the new baseline.
-- A run overwrites Silver and Gold in place, so a crash mid-write can leave a layer partly written.
+- Publishing is atomic per table, not across tables: a crash between two tables can leave the live
+  lake with some tables from the new run and some from the old one. The watermark is written last,
+  so the next incremental run repeats the merge.
+- Delta keeps every version until `VACUUM` is run; this project does not vacuum, so old versions
+  take disk space.
 - Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.
-- The quality gate runs after Gold is written, so a failed run leaves the failing output in place.
-  It signals failure through the exit code and the report.
+- A failed gate leaves its candidate tables in `state/candidate` for inspection until the next run.
+  Live data is not changed.

@@ -110,6 +110,21 @@ version per customer, unique `(customer_id, valid_from)` and that every order ma
 Limit: the dimension is recomputed from all of Bronze on each run, which is cheap for a customer
 table but does not follow the watermark.
 
+### Orchestration
+
+`pipeline.py` defines four tasks (bronze, silver, gold, quality) and `orchestrator.py` runs them in
+order. A failing task is retried with exponential backoff (`--retries`, `--retry-delay`); the
+attempt counts are stored in the run result. A failed quality gate (`DataQualityError`) is never
+retried, because repeating the same checks cannot change the outcome. A standard-library runner was
+chosen over Airflow or Prefect because the chain is linear and single-machine; any scheduler, such
+as cron, can invoke the CLI.
+
+### Dashboard
+
+`medallion-pipeline dashboard` reads the Gold marts and renders `dashboard/index.html`: inline CSS
+and SVG, no JavaScript or external assets. The rendering functions take plain Python rows, so they
+are tested without Spark.
+
 ## Quality gate
 
 After Gold is built, the gate checks:
@@ -122,6 +137,13 @@ After Gold is built, the gate checks:
 - Rejection rate: for each entity, the share of this batch's rows that went to quarantine must not
   exceed `--max-rejection-rate` (default 10%). The rates are written to the report as
   `batch_rejection_rates`.
+
+- Rejection trend: every run appends its row counts, rejection rates and outcome to
+  `state/run_history.jsonl`. With at least 3 earlier passing runs, an entity fails when its rate is
+  more than 5 points above the median of the last 20 passing runs. This catches a drift that stays
+  under the absolute limit.
+- Customer history (SCD Type 2): one current version per customer, unique `(customer_id,
+  valid_from)` and every order matched to a version.
 
 The rejection rate counts only rows whose `_batch_id` is the current batch. Quarantine keeps every
 rejected row ever delivered, while Silver keeps one version per key, so a rate over the whole lake
@@ -145,9 +167,8 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 
 ## Known limitations
 
-- Rejection rates are recorded per run but not yet compared across runs, so a slow drift below the
-  limit is not flagged. A history of run reports would make that possible.
-
+- The trend check needs three earlier passing runs and compares against a median, so a slow drift
+  across more than 20 runs becomes the new baseline.
 - A run overwrites Silver and Gold in place, so a crash mid-write can leave a layer partly written.
 - Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.
 - The quality gate runs after Gold is written, so a failed run leaves the failing output in place.

@@ -10,7 +10,6 @@ lines of a re-delivered order replace its previous lines.
 """
 
 import json
-import shutil
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
@@ -25,6 +24,7 @@ from medallion_pipeline.silver import (
     clean_products,
     keep_latest,
 )
+from medallion_pipeline.tables import read_table
 
 WATERMARK_FILE = "watermark.json"
 
@@ -58,10 +58,8 @@ def bronze_batches(bronze: dict[str, DataFrame]) -> set[str]:
 
 def read_silver(spark: SparkSession, paths: LakePaths) -> SilverTables:
     return SilverTables(
-        **{name: spark.read.parquet((paths.silver / name).as_posix()) for name in ENTITIES},
-        quarantine={
-            name: spark.read.parquet((paths.quarantine / name).as_posix()) for name in ENTITIES
-        },
+        **{name: read_table(spark, paths.silver / name) for name in ENTITIES},
+        quarantine={name: read_table(spark, paths.quarantine / name) for name in ENTITIES},
     )
 
 
@@ -118,26 +116,3 @@ def merge_silver(
         order_items=items,
         quarantine=quarantine,
     )
-
-
-def write_silver_merged(silver: SilverTables, paths: LakePaths) -> None:
-    """Write merged tables via a staging directory.
-
-    The merged frames read from the directories they replace, and Spark cannot overwrite a path it
-    is reading, so every table is materialised in staging before the live copy is swapped.
-    """
-    staging = paths.state / "staging"
-    shutil.rmtree(staging, ignore_errors=True)
-    targets = [
-        *((df, paths.silver / name) for name, df in silver.as_dict().items()),
-        *((df, paths.quarantine / name) for name, df in silver.quarantine.items()),
-    ]
-    staged: list[tuple[Path, Path]] = []
-    for df, live in targets:
-        stage = staging / live.parent.name / live.name
-        df.write.mode("overwrite").parquet(stage.as_posix())
-        staged.append((stage, live))
-    for stage, live in staged:
-        shutil.rmtree(live, ignore_errors=True)
-        shutil.move(stage, live)
-    shutil.rmtree(staging, ignore_errors=True)

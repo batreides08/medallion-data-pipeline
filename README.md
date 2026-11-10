@@ -65,6 +65,10 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Static BI dashboard.** `medallion-pipeline dashboard` renders the Gold marts (revenue trend,
   customer value segments, lifetime revenue by country, category and top-product revenue) as one
   self-contained HTML page with inline SVG, with no JavaScript, paid tools or external assets.
+- **Atomic publishing with Delta Lake.** Silver, Quarantine and Gold are Delta tables. A run builds
+  them in `state/candidate`, runs the quality gate there and only then copies them over the live
+  tables, so a failed gate leaves the previously published data untouched. Each commit is a
+  numbered version that can be read back (time travel). Bronze stays Parquet.
 - **Verifiable tests.** The generator injects a known number of defects and states how many rows
   each table must end up with, so the tests compare against an independent source of truth.
 - **Synthetic data only.** Everything is produced from a seeded random generator, so results are
@@ -103,10 +107,13 @@ Render the dashboard from the Gold marts and open `data/dashboard/index.html`:
 medallion-pipeline dashboard --data-dir data
 ```
 
-Query the results with any Parquet reader, for example from `pyspark`:
+Query the results with any Delta reader, for example from `pyspark` with the Delta extensions
+(`medallion_pipeline.spark.create_spark_session` configures them):
 
 ```python
-spark.read.parquet("data/gold/daily_revenue").orderBy("order_date").show(5)
+spark.read.format("delta").load("data/gold/daily_revenue").orderBy("order_date").show(5)
+# An earlier published version of the same table
+spark.read.format("delta").option("versionAsOf", 0).load("data/gold/daily_revenue")
 ```
 
 ## Testing
@@ -142,6 +149,7 @@ src/medallion_pipeline/
 ├── silver.py           Typing, validation, deduplication, quarantine
 ├── scd2.py             Customer history (dim_customer) and point-in-time order join
 ├── gold.py             Runs the SQL marts
+├── tables.py           Delta read/write helpers and table versions
 ├── dashboard.py        Static HTML dashboard over the Gold marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate

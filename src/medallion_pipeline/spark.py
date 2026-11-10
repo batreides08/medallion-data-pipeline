@@ -3,6 +3,7 @@
 import os
 import sys
 
+from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 
 
@@ -13,7 +14,7 @@ def create_spark_session(
     # Workers must use this interpreter; a bare "python3" does not exist on Windows.
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    return (
+    builder = (
         SparkSession.builder.appName(app_name)
         .master(master)
         .config("spark.ui.enabled", "false")
@@ -23,5 +24,11 @@ def create_spark_session(
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
         # Batch ids stay strings even when they look numeric.
         .config("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
-        .getOrCreate()
+        # Delta Lake gives Silver and Gold atomic writes and time travel.
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
     )
+    return configure_spark_with_delta_pip(builder).getOrCreate()

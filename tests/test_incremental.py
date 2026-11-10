@@ -9,12 +9,13 @@ from medallion_pipeline.config import ENTITIES, LakePaths
 from medallion_pipeline.data_generator import generate_raw_data
 from medallion_pipeline.incremental import read_watermark, write_watermark
 from medallion_pipeline.pipeline import run_pipeline
+from medallion_pipeline.tables import read_table
 
 pytestmark = pytest.mark.parquet_io
 
 
 def _rows(spark: SparkSession, path: Path, key: list[str]) -> list[tuple]:
-    df = spark.read.parquet(path.as_posix()).drop("_source_file", "_ingested_at")
+    df = read_table(spark, path).drop("_source_file", "_ingested_at")
     return sorted(tuple(r) for r in df.select(*sorted(df.columns)).orderBy(*key).collect())
 
 

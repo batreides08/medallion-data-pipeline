@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +20,6 @@ from medallion_pipeline.incremental import (
     merge_silver,
     read_silver,
     read_watermark,
-    write_silver_merged,
     write_watermark,
 )
 from medallion_pipeline.orchestrator import RetryPolicy, Task, run_tasks
@@ -34,6 +34,7 @@ from medallion_pipeline.quality import (
 )
 from medallion_pipeline.scd2 import build_dim_customer, orders_with_customer_version, write_scd2
 from medallion_pipeline.silver import SilverTables, build_silver, write_silver
+from medallion_pipeline.tables import copy_table, read_table
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +108,16 @@ def run_pipeline(
     itself, so a replay is merged again) are cleaned and merged into the existing Silver tables.
     The first incremental run, which has no watermark, performs a full rebuild.
 
-    Each layer (bronze, silver, gold, quality) is a task retried according to ``retry_policy``.
+    Silver and Gold are first built in a candidate lake (``state/candidate``). Only when the quality
+    gate passes does the ``publish`` task copy them over the live Delta tables, so a failed gate
+    leaves the previously published data untouched and every earlier version stays queryable.
+
+    Each layer (bronze, silver, gold, quality, publish) is a task retried according to ``retry_policy``.
     Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
     retried because running the same checks again cannot change the outcome.
     """
     batch_id = batch_id or default_batch_id()
+    candidate = paths.candidate
     state: dict[str, Any] = {}
 
     def bronze_task() -> None:
@@ -123,26 +129,27 @@ def run_pipeline(
     def silver_task() -> None:
         bronze = state["bronze"]
         processed = read_watermark(paths)
+        # Built in the candidate lake: the live tables change only after the quality gate passes.
+        shutil.rmtree(candidate.root, ignore_errors=True)
         if incremental and processed:
             new_batches = (state["all_batches"] - processed) | {batch_id}
             logger.info("Silver: merging batches %s", sorted(new_batches))
-            write_silver_merged(merge_silver(read_silver(spark, paths), bronze, new_batches), paths)
+            write_silver(merge_silver(read_silver(spark, paths), bronze, new_batches), candidate)
         else:
             logger.info("Silver: validating and deduplicating all batches")
-            write_silver(build_silver(bronze), paths)
-        write_watermark(paths, state["all_batches"])
-        state["silver"] = read_silver(spark, paths)
+            write_silver(build_silver(bronze), candidate)
+        state["silver"] = read_silver(spark, candidate)
 
     def gold_task() -> None:
         logger.info("Gold: building marts")
-        write_gold(build_gold(state["silver"]), paths)
+        write_gold(build_gold(state["silver"]), candidate)
         logger.info("Gold: building customer history (SCD Type 2)")
         dim_customer = build_dim_customer(state["bronze"]["customers"])
         order_versions = orders_with_customer_version(state["silver"].orders, dim_customer)
-        write_scd2(dim_customer, order_versions, paths)
+        write_scd2(dim_customer, order_versions, candidate)
         state["gold"] = {
-            path.name: spark.read.parquet(path.as_posix())
-            for path in sorted(paths.gold.iterdir())
+            path.name: read_table(spark, path)
+            for path in sorted(candidate.gold.iterdir())
             if path.is_dir()
         }
 
@@ -169,12 +176,27 @@ def run_pipeline(
         state["result"] = result
         assert_all_passed(result.checks)
 
+    def publish_task() -> None:
+        """Copy the verified candidate tables over the live ones, one Delta commit per table."""
+        logger.info("Publish: replacing live Silver, Quarantine and Gold")
+        for source_root, live_root in (
+            (candidate.silver, paths.silver),
+            (candidate.quarantine, paths.quarantine),
+            (candidate.gold, paths.gold),
+        ):
+            for table in sorted(p for p in source_root.iterdir() if p.is_dir()):
+                copy_table(spark, table, live_root / table.name)
+        # Last, so a crash while publishing makes the next incremental run repeat the merge.
+        write_watermark(paths, state["all_batches"])
+        shutil.rmtree(candidate.root, ignore_errors=True)
+
     attempts = run_tasks(
         [
             Task("bronze", bronze_task),
             Task("silver", silver_task),
             Task("gold", gold_task),
             Task("quality", quality_task, no_retry=(DataQualityError,)),
+            Task("publish", publish_task),
         ],
         retry_policy,
     )

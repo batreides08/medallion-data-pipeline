@@ -6,6 +6,7 @@ from pyspark.sql import DataFrame
 
 from medallion_pipeline.config import REVENUE_STATUSES, LakePaths
 from medallion_pipeline.silver import SilverTables
+from medallion_pipeline.tables import write_table
 
 MARTS = ("daily_revenue", "customer_lifetime_value", "product_performance")
 
@@ -27,4 +28,4 @@ def build_gold(silver: SilverTables) -> dict[str, DataFrame]:
 
 def write_gold(gold: dict[str, DataFrame], paths: LakePaths) -> None:
     for name, df in gold.items():
-        df.write.mode("overwrite").parquet((paths.gold / name).as_posix())
+        write_table(df, paths.gold / name)

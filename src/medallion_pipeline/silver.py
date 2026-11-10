@@ -12,6 +12,7 @@ from pyspark.sql import functions as F
 
 from medallion_pipeline.bronze import CORRUPT_RECORD
 from medallion_pipeline.config import ORDER_STATUSES, LakePaths
+from medallion_pipeline.tables import write_table
 
 REJECTION_REASONS = "_rejection_reasons"
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
@@ -199,6 +200,6 @@ def build_silver(bronze: dict[str, DataFrame]) -> SilverTables:
 
 def write_silver(silver: SilverTables, paths: LakePaths) -> None:
     for name, df in silver.as_dict().items():
-        df.write.mode("overwrite").parquet((paths.silver / name).as_posix())
+        write_table(df, paths.silver / name)
     for name, df in silver.quarantine.items():
-        df.write.mode("overwrite").parquet((paths.quarantine / name).as_posix())
+        write_table(df, paths.quarantine / name)

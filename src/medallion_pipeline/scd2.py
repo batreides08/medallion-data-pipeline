@@ -14,6 +14,7 @@ from pyspark.sql import functions as F
 
 from medallion_pipeline.config import LakePaths
 from medallion_pipeline.silver import validate_customers
+from medallion_pipeline.tables import write_table
 
 TRACKED = ("full_name", "email", "country")
 
@@ -93,7 +94,5 @@ def orders_with_customer_version(orders: DataFrame, dim_customer: DataFrame) -> 
 
 
 def write_scd2(dim_customer: DataFrame, order_versions: DataFrame, paths: LakePaths) -> None:
-    dim_customer.write.mode("overwrite").parquet((paths.gold / "dim_customer").as_posix())
-    order_versions.write.mode("overwrite").parquet(
-        (paths.gold / "order_customer_version").as_posix()
-    )
+    write_table(dim_customer, paths.gold / "dim_customer")
+    write_table(order_versions, paths.gold / "order_customer_version")

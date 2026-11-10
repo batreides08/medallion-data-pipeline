@@ -15,6 +15,7 @@ from typing import Any
 from pyspark.sql import SparkSession
 
 from medallion_pipeline.config import LakePaths
+from medallion_pipeline.tables import read_table
 
 Row = Mapping[str, Any]
 SEGMENT_ORDER = ("vip", "regular", "occasional", "inactive")
@@ -169,7 +170,7 @@ def render_dashboard(
 def build_dashboard(spark: SparkSession, paths: LakePaths, output: Path | None = None) -> Path:
     """Read the Gold marts from the lake and write the dashboard page."""
     marts = {
-        name: [r.asDict() for r in spark.read.parquet((paths.gold / name).as_posix()).collect()]
+        name: [r.asDict() for r in read_table(spark, paths.gold / name).collect()]
         for name in ("daily_revenue", "customer_lifetime_value", "product_performance")
     }
     page = render_dashboard(

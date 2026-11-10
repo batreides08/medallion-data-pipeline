@@ -18,7 +18,9 @@ from medallion_pipeline.quality import (
     assert_all_passed,
     run_checks,
 )
+from medallion_pipeline.incremental import read_watermark
 from medallion_pipeline.silver import SilverTables, build_silver
+from medallion_pipeline.tables import is_table, read_table, table_versions
 
 
 def _assert_matches_generator(counts: dict[str, int], expected: ExpectedCounts) -> None:
@@ -253,7 +255,7 @@ def test_transient_failure_in_a_layer_is_retried(
 
     result = run_pipeline(spark, paths, "batch-1", retry_policy=RetryPolicy(1, 0))
 
-    assert result.task_attempts == {"bronze": 1, "silver": 1, "gold": 2, "quality": 1}
+    assert result.task_attempts == {"bronze": 1, "silver": 1, "gold": 2, "quality": 1, "publish": 1}
     _assert_matches_generator(result.row_counts, expected)
 
 
@@ -270,3 +272,37 @@ def test_failed_quality_gate_is_not_retried(
 
     history = (paths.state / "run_history.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(history) == 1
+
+
+@pytest.mark.parquet_io
+def test_failed_quality_gate_does_not_publish(
+    spark: SparkSession, fresh_lake: tuple[LakePaths, ExpectedCounts]
+) -> None:
+    paths, expected = fresh_lake
+    run_pipeline(spark, paths, "batch-1")
+    published = read_table(spark, paths.silver / "orders").count()
+    assert published == expected.silver_orders
+    versions = table_versions(spark, paths.silver / "orders")
+
+    with pytest.raises(DataQualityError):
+        run_pipeline(spark, paths, "batch-2", max_rejection_rate=0.0)
+
+    assert table_versions(spark, paths.silver / "orders") == versions
+    assert read_table(spark, paths.silver / "orders").count() == published
+    assert read_watermark(paths) == {"batch-1"}
+
+
+@pytest.mark.parquet_io
+def test_earlier_versions_stay_queryable(
+    spark: SparkSession, fresh_lake: tuple[LakePaths, ExpectedCounts]
+) -> None:
+    paths, expected = fresh_lake
+    run_pipeline(spark, paths, "batch-1")
+    run_pipeline(spark, paths, "batch-1")
+
+    path = paths.gold / "daily_revenue"
+    versions = table_versions(spark, path)
+    assert len(versions) == 2
+    first = read_table(spark, path, version=versions[0])
+    assert first.count() == read_table(spark, path).count() > 0
+    assert is_table(path)

@@ -46,3 +46,8 @@ class LakePaths:
     @property
     def state(self) -> Path:
         return self.root / "state"
+
+    @property
+    def candidate(self) -> "LakePaths":
+        """Scratch lake where a run builds Silver and Gold before the quality gate has passed."""
+        return LakePaths(self.state / "candidate")

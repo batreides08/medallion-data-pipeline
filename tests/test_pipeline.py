@@ -10,6 +10,7 @@ from medallion_pipeline.cli import main
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
 from medallion_pipeline.data_generator import ExpectedCounts, generate_raw_data
 from medallion_pipeline.gold import build_gold
+from medallion_pipeline.incremental import read_watermark
 from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import batch_row_counts, count_rows, run_pipeline
 from medallion_pipeline.quality import (
@@ -18,7 +19,6 @@ from medallion_pipeline.quality import (
     assert_all_passed,
     run_checks,
 )
-from medallion_pipeline.incremental import read_watermark
 from medallion_pipeline.silver import SilverTables, build_silver
 from medallion_pipeline.tables import is_table, read_table, table_versions
 
@@ -296,7 +296,7 @@ def test_failed_quality_gate_does_not_publish(
 def test_earlier_versions_stay_queryable(
     spark: SparkSession, fresh_lake: tuple[LakePaths, ExpectedCounts]
 ) -> None:
-    paths, expected = fresh_lake
+    paths, _ = fresh_lake
     run_pipeline(spark, paths, "batch-1")
     run_pipeline(spark, paths, "batch-1")
 

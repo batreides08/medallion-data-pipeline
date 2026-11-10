@@ -112,7 +112,8 @@ def run_pipeline(
     gate passes does the ``publish`` task copy them over the live Delta tables, so a failed gate
     leaves the previously published data untouched and every earlier version stays queryable.
 
-    Each layer (bronze, silver, gold, quality, publish) is a task retried according to ``retry_policy``.
+    Each layer (bronze, silver, gold, quality, publish) is a task retried according to
+    ``retry_policy``.
     Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
     retried because running the same checks again cannot change the outcome.
     """

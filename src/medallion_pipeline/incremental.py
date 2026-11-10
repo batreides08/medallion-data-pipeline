@@ -59,9 +59,7 @@ def bronze_batches(bronze: dict[str, DataFrame]) -> set[str]:
 def read_silver(spark: SparkSession, paths: LakePaths) -> SilverTables:
     return SilverTables(
         **{name: read_table(spark, paths.silver / name) for name in ENTITIES},
-        quarantine={
-            name: read_table(spark, paths.quarantine / name) for name in ENTITIES
-        },
+        quarantine={name: read_table(spark, paths.quarantine / name) for name in ENTITIES},
     )
 
 

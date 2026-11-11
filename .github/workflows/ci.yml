@@ -56,3 +56,4 @@ jobs:
       - run: pip install -e .
       - run: medallion-pipeline generate --data-dir data
       - run: medallion-pipeline run --data-dir data --batch-id ci-smoke
+      - run: medallion-pipeline vacuum --data-dir data --retain-hours 0 --allow-short-retention

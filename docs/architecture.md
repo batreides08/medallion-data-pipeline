@@ -170,6 +170,7 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 | Rejection rate per batch, with one limit for every entity | Measures the delivery just received and stays simple to reason about | A record re-delivered with an older version than Silver holds counts in neither side of the rate |
 | Gold in `.sql` files | Business logic stays readable by analysts and reviewable on its own | Requires a small templating step for shared constants |
 | Delta Lake for Silver, Quarantine and Gold; Parquet for Bronze | ACID commits, time travel, and overwriting a table that is being read | One extra dependency, pinned to a Spark version it supports; Bronze keeps plain Parquet because it is append-only raw data |
+| VACUUM as its own command with a 168-hour default | Retention is an operational choice, separate from producing data; the default matches Delta's safety check | A window under 168 hours must be requested explicitly with `--allow-short-retention` |
 | Build in a candidate lake, publish after the gate | A failed gate never changes live data | Data is written twice, and a publish is one commit per table, not one for the whole lake |
 | Synthetic data | Reproducible, free of private data, and defects are known exactly | Volumes and distributions are not those of a real business |
 | Generator states expected counts | Tests compare with a source independent of the code under test | The generator has to be kept in sync when defects are added |
@@ -181,8 +182,9 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 - Publishing is atomic per table, not across tables: a crash between two tables can leave the live
   lake with some tables from the new run and some from the old one. The watermark is written last,
   so the next incremental run repeats the merge.
-- Delta keeps every version until `VACUUM` is run; this project does not vacuum, so old versions
-  take disk space.
+- `VACUUM` is a separate command, not part of `run`: old versions take disk space until it is run
+  (for example from the same cron schedule). It only removes data files; the transaction log
+  still lists the old versions, and reading one that was vacuumed fails.
 - Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.
 - A failed gate leaves its candidate tables in `state/candidate` for inspection until the next run.
   Live data is not changed.

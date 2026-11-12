@@ -51,6 +51,10 @@ flowchart TD
 ### Bronze
 
 - Every field is read as a string, so a bad value cannot fail ingestion.
+- CSV columns are matched by header name, not position (`contracts.py`). Names must match exactly;
+  order does not matter. A missing or duplicated required column raises `RawContractError` before
+  anything is written, and the run is not retried because the file will not change. Extra columns
+  are logged and dropped. JSON orders are already matched by field name.
 - Malformed JSON is kept in `_corrupt_record`.
 - Each row carries `_source_file`, `_ingested_at` and `_batch_id`.
 - Data is partitioned by `_batch_id`. Overwriting is dynamic, so re-running a batch replaces only

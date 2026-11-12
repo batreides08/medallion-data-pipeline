@@ -69,6 +69,10 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   them in `state/candidate`, runs the quality gate there and only then copies them over the live
   tables, so a failed gate leaves the previously published data untouched. Each commit is a
   numbered version that can be read back (time travel). Bronze stays Parquet.
+- **Table retention (VACUUM).** `medallion-pipeline vacuum` deletes the data files of Delta
+  versions older than a retention window (168 hours by default, Delta's own safety limit) and
+  logs the files and bytes freed per table. A shorter window needs `--allow-short-retention`,
+  because a reader that started earlier may still need those files.
 - **Verifiable tests.** The generator injects a known number of defects and states how many rows
   each table must end up with, so the tests compare against an independent source of truth.
 - **Synthetic data only.** Everything is produced from a seeded random generator, so results are
@@ -116,6 +120,14 @@ spark.read.format("delta").load("data/gold/daily_revenue").orderBy("order_date")
 spark.read.format("delta").option("versionAsOf", 0).load("data/gold/daily_revenue")
 ```
 
+Bound the disk used by old versions (time travel then reaches back 7 days):
+
+```bash
+medallion-pipeline vacuum --data-dir data
+# Keep only the latest version; safe only when nothing else reads the lake
+medallion-pipeline vacuum --data-dir data --retain-hours 0 --allow-short-retention
+```
+
 ## Testing
 
 ```bash
@@ -150,12 +162,13 @@ src/medallion_pipeline/
 ├── scd2.py             Customer history (dim_customer) and point-in-time order join
 ├── gold.py             Runs the SQL marts
 ├── tables.py           Delta read/write helpers and table versions
+├── maintenance.py      VACUUM of the published Delta tables
 ├── dashboard.py        Static HTML dashboard over the Gold marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate
 ├── orchestrator.py     Task runner with per-task retries and backoff
 ├── pipeline.py         Defines the layer tasks of one run
-└── cli.py              generate, run and dashboard commands
+└── cli.py              generate, run, dashboard and vacuum commands
 tests/                  Unit and end-to-end tests
 docs/architecture.md    Design decisions and data model
 ```

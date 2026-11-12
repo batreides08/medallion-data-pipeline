@@ -1,4 +1,4 @@
-"""Command line interface: ``medallion-pipeline generate|run``."""
+"""Command line interface: ``medallion-pipeline generate|run|dashboard|vacuum``."""
 
 import argparse
 import logging
@@ -9,6 +9,7 @@ from pathlib import Path
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.dashboard import build_dashboard
 from medallion_pipeline.data_generator import GenerationConfig, generate_raw_data
+from medallion_pipeline.maintenance import DEFAULT_RETENTION_HOURS, vacuum_lake
 from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import run_pipeline
 from medallion_pipeline.quality import DataQualityError
@@ -30,6 +31,16 @@ def _non_negative_int(value: str) -> int:
         number = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"{value} is negative")
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
     return number
@@ -77,6 +88,22 @@ def _build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--output", type=Path, help="defaults to <data-dir>/dashboard/index.html"
     )
+
+    vacuum = commands.add_parser(
+        "vacuum", help="delete Delta files of versions older than the retention window"
+    )
+    vacuum.add_argument("--data-dir", type=Path, default=Path("data"))
+    vacuum.add_argument(
+        "--retain-hours",
+        type=_non_negative_float,
+        default=DEFAULT_RETENTION_HOURS,
+        help=f"hours of history to keep readable (default: {DEFAULT_RETENTION_HOURS})",
+    )
+    vacuum.add_argument(
+        "--allow-short-retention",
+        action="store_true",
+        help="permit a window under the default; only when nothing else reads the lake",
+    )
     return parser
 
 
@@ -99,6 +126,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             logging.info("Dashboard written to %s", build_dashboard(spark, paths, args.output))
         finally:
             spark.stop()
+        return 0
+
+    if args.command == "vacuum":
+        if args.retain_hours < DEFAULT_RETENTION_HOURS and not args.allow_short_retention:
+            logging.error(
+                "--retain-hours %s is below the %d-hour safety window; add "
+                "--allow-short-retention if nothing else reads the lake",
+                args.retain_hours,
+                DEFAULT_RETENTION_HOURS,
+            )
+            return 2
+        spark = create_spark_session()
+        try:
+            results = vacuum_lake(spark, paths, args.retain_hours, args.allow_short_retention)
+        finally:
+            spark.stop()
+        logging.info(
+            "Vacuumed %d tables; removed %d files (%d bytes)",
+            len(results),
+            sum(r.files_removed for r in results),
+            sum(r.bytes_removed for r in results),
+        )
         return 0
 
     if not (paths.raw / "orders.jsonl").exists():

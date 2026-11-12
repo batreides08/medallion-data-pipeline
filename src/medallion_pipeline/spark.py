@@ -22,6 +22,9 @@ def create_spark_session(
         .config("spark.sql.shuffle.partitions", "4")
         # Re-running a batch replaces only that batch's Bronze partition.
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        # Delta's VACUUM lists files with one task per slot of this setting (default 10,000),
+        # which costs minutes on a local machine for a lake of a few hundred files.
+        .config("spark.sql.sources.parallelPartitionDiscovery.parallelism", "8")
         # Batch ids stay strings even when they look numeric.
         .config("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
         # Delta Lake gives Silver and Gold atomic writes and time travel.

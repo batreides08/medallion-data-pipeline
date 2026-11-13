@@ -59,6 +59,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   (`orchestrator.py`) rather than Airflow or Prefect: the chain is linear and single-machine, so a
   scheduler service would add moving parts without benefit. Schedule it with any free tool, for
   example cron: `0 2 * * * medallion-pipeline run --incremental --retries 2`.
+- **Per-task timing.** The run report lists every task that ran (bronze, silver, gold, quality,
+  publish) with its status, attempts and duration in seconds, plus their total. It is rewritten
+  after a failed gate or publish, so a slow or failing layer shows up in the report of that run.
 - **Customer history (SCD Type 2).** `gold/dim_customer` keeps every version of a customer with a
   `[valid_from, valid_to)` range, and `gold/order_customer_version` joins each order to the version
   valid when it was placed. Only attribute changes create a version.
@@ -93,7 +96,7 @@ medallion-pipeline run --data-dir data
 The lake is written to `data/`, with a report at `data/reports/run_<batch_id>.json`.
 
 The report holds row counts, the share of each entity's rows in this batch that went to quarantine,
-and every quality check. To change how much quarantine a batch may produce before it fails:
+every quality check, and the status, attempts and duration of each task. To change how much quarantine a batch may produce before it fails:
 
 ```bash
 medallion-pipeline run --data-dir data --max-rejection-rate 0.05

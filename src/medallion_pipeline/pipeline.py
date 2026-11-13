@@ -22,7 +22,7 @@ from medallion_pipeline.incremental import (
     read_watermark,
     write_watermark,
 )
-from medallion_pipeline.orchestrator import RetryPolicy, Task, run_tasks
+from medallion_pipeline.orchestrator import RetryPolicy, Task, TaskRun, run_tasks
 from medallion_pipeline.quality import (
     CheckResult,
     DataQualityError,
@@ -48,6 +48,7 @@ class RunResult:
     checks: list[CheckResult]
     report_path: Path
     task_attempts: dict[str, int] = field(default_factory=dict)
+    task_runs: list[TaskRun] = field(default_factory=list)
 
 
 def default_batch_id() -> str:
@@ -86,6 +87,8 @@ def write_report(result: RunResult) -> None:
         "batch_rejection_rates": result.batch_rejection_rates,
         "max_rejection_rate": result.max_rejection_rate,
         "checks": [check.as_dict() for check in result.checks],
+        "tasks": [run.as_dict() for run in result.task_runs],
+        "total_task_seconds": round(sum(run.duration_seconds for run in result.task_runs), 3),
     }
     result.report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
@@ -113,7 +116,8 @@ def run_pipeline(
     leaves the previously published data untouched and every earlier version stays queryable.
 
     Each layer (bronze, silver, gold, quality, publish) is a task retried according to
-    ``retry_policy``.
+    ``retry_policy``. The report lists every task that ran with its outcome, attempts and duration,
+    so a slow layer is visible run by run.
     Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
     retried because running the same checks again cannot change the outcome.
     """
@@ -191,16 +195,25 @@ def run_pipeline(
         write_watermark(paths, state["all_batches"])
         shutil.rmtree(candidate.root, ignore_errors=True)
 
-    attempts = run_tasks(
-        [
-            Task("bronze", bronze_task),
-            Task("silver", silver_task),
-            Task("gold", gold_task),
-            Task("quality", quality_task, no_retry=(DataQualityError,)),
-            Task("publish", publish_task),
-        ],
-        retry_policy,
-    )
+    task_runs: list[TaskRun] = []
+    try:
+        attempts = run_tasks(
+            [
+                Task("bronze", bronze_task),
+                Task("silver", silver_task),
+                Task("gold", gold_task),
+                Task("quality", quality_task, no_retry=(DataQualityError,)),
+                Task("publish", publish_task),
+            ],
+            retry_policy,
+            on_task_end=task_runs.append,
+        )
+    finally:
+        # The quality task writes the report before publish runs, so rewrite it with the timing
+        # of every task that ran, including a failed gate or a failed publish.
+        if "result" in state:
+            state["result"] = replace(state["result"], task_runs=list(task_runs))
+            write_report(state["result"])
     result = replace(state["result"], task_attempts=attempts)
     logger.info("Run %s finished; report at %s", batch_id, result.report_path)
     return result

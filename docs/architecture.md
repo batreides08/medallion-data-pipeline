@@ -112,12 +112,19 @@ table but does not follow the watermark.
 
 ### Orchestration
 
-`pipeline.py` defines four tasks (bronze, silver, gold, quality) and `orchestrator.py` runs them in
-order. A failing task is retried with exponential backoff (`--retries`, `--retry-delay`); the
+`pipeline.py` defines five tasks (bronze, silver, gold, quality, publish) and `orchestrator.py` runs
+them in order. A failing task is retried with exponential backoff (`--retries`, `--retry-delay`); the
 attempt counts are stored in the run result. A failed quality gate (`DataQualityError`) is never
 retried, because repeating the same checks cannot change the outcome. A standard-library runner was
 chosen over Airflow or Prefect because the chain is linear and single-machine; any scheduler, such
 as cron, can invoke the CLI.
+
+Each task's outcome, attempts and duration are recorded as a `TaskRun` and written to the run report
+under `tasks`, with their sum as `total_task_seconds`. The duration adds up the attempts and leaves
+out the backoff waits, so it measures work rather than waiting. The quality task writes the report
+before `publish` runs, so the pipeline rewrites it once the chain stops; a failed gate or a failed
+publish is therefore recorded with the timings of every task that ran. A failure in bronze, silver or
+gold happens before any report exists and is only logged.
 
 ### Atomic publishing
 
@@ -186,5 +193,8 @@ The report is written first, so a failed run still leaves evidence. The pipeline
   (for example from the same cron schedule). It only removes data files; the transaction log
   still lists the old versions, and reading one that was vacuumed fails.
 - Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.
+- Task durations are wall-clock time on the machine that ran the job. They are comparable between
+  runs of the same environment, not across machines, and the run history does not yet store them,
+  so a slowdown is visible per report rather than flagged automatically.
 - A failed gate leaves its candidate tables in `state/candidate` for inspection until the next run.
   Live data is not changed.

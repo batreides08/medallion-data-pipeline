@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
+from medallion_pipeline.contracts import RawContractError
 from medallion_pipeline.dashboard import build_dashboard
 from medallion_pipeline.data_generator import GenerationConfig, generate_raw_data
 from medallion_pipeline.maintenance import DEFAULT_RETENTION_HOURS, vacuum_lake
@@ -164,7 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.incremental,
             RetryPolicy(args.retries, max(args.retry_delay, 0.0)),
         )
-    except DataQualityError as error:
+    except (DataQualityError, RawContractError) as error:
         logging.error("%s", error)
         return 1
     finally:

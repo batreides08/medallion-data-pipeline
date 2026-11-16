@@ -43,6 +43,11 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   of Bronze by default, so repeated deliveries do not create duplicates. With `--incremental`,
   only batches missing from a watermark file (`state/watermark.json`) are cleaned and merged into
   Silver; a test checks the result equals a full rebuild.
+- **Column contracts on raw CSV files.** Spark maps CSV columns to a schema by position and only
+  logs a warning when the header disagrees, so a delivery with reordered columns would silently put
+  emails in `full_name`. Bronze checks each header first and then reads columns by name: reordered
+  columns are mapped correctly, extra ones are logged and ignored, and a missing or duplicated
+  required column stops the run (exit code 1) before Bronze is written, without retries.
 - **A quality gate that can stop a run.** It checks primary keys, required fields and references
   between tables, and reconciles revenue across every Gold mart to the cent. The report is written
   even when the gate fails.
@@ -157,6 +162,7 @@ $env:JAVA_TOOL_OPTIONS = '-Djdk.net.unixdomain.tmpdir=C:\Windows\Temp'
 ```text
 src/medallion_pipeline/
 ├── data_generator.py   Seeded raw data with known defects
+├── contracts.py        Column contracts checked on raw CSV headers
 ├── bronze.py           Raw ingestion with lineage
 ├── silver.py           Typing, validation, deduplication, quarantine
 ├── scd2.py             Customer history (dim_customer) and point-in-time order join

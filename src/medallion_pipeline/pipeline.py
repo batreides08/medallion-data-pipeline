@@ -13,6 +13,7 @@ from pyspark.sql import functions as F
 
 from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
+from medallion_pipeline.contracts import RawContractError
 from medallion_pipeline.gold import build_gold, write_gold
 from medallion_pipeline.history import append_run, check_rejection_trend, read_history
 from medallion_pipeline.incremental import (
@@ -119,7 +120,9 @@ def run_pipeline(
     ``retry_policy``. The report lists every task that ran with its outcome, attempts and duration,
     so a slow layer is visible run by run.
     Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
-    retried because running the same checks again cannot change the outcome.
+    retried because running the same checks again cannot change the outcome, and neither is a raw
+    CSV whose header breaks its column contract (:class:`RawContractError`), which stops the run
+    before Bronze is written.
     """
     batch_id = batch_id or default_batch_id()
     candidate = paths.candidate
@@ -199,7 +202,7 @@ def run_pipeline(
     try:
         attempts = run_tasks(
             [
-                Task("bronze", bronze_task),
+                Task("bronze", bronze_task, no_retry=(RawContractError,)),
                 Task("silver", silver_task),
                 Task("gold", gold_task),
                 Task("quality", quality_task, no_retry=(DataQualityError,)),

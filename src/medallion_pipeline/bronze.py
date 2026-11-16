@@ -4,11 +4,17 @@ Every field is read as a string so that a bad value can never fail ingestion. Ju
 Silver's job; Bronze only guarantees that what arrived can be replayed.
 """
 
+import logging
+from pathlib import Path
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 
 from medallion_pipeline.config import LakePaths
+from medallion_pipeline.contracts import validate_csv_headers
+
+logger = logging.getLogger(__name__)
 
 CORRUPT_RECORD = "_corrupt_record"
 TABLES = ("customers", "products", "orders")
@@ -42,14 +48,31 @@ def _with_lineage(df: DataFrame, batch_id: str) -> DataFrame:
     )
 
 
+def _read_csv(spark: SparkSession, path: Path, schema: StructType) -> DataFrame:
+    """Read a CSV whose header has passed its contract, selecting columns by header name.
+
+    Without a schema and with ``inferSchema`` off, Spark reads every column as a string under the
+    name in the header, so reordered columns land in the right place and extra ones are dropped.
+    """
+    df = spark.read.csv(path.as_posix(), header=True, inferSchema=False)
+    return df.select(*(F.col(f"`{name}`") for name in schema.fieldNames()))
+
+
 def read_raw(spark: SparkSession, paths: LakePaths, batch_id: str) -> dict[str, DataFrame]:
-    """Read the raw files of one delivery, tagged with lineage columns."""
-    customers = spark.read.schema(CUSTOMERS_SCHEMA).csv(
-        (paths.raw / "customers.csv").as_posix(), header=True
-    )
-    products = spark.read.schema(PRODUCTS_SCHEMA).csv(
-        (paths.raw / "products.csv").as_posix(), header=True
-    )
+    """Read the raw files of one delivery, tagged with lineage columns.
+
+    CSV headers are checked first: a missing or duplicated required column raises
+    :class:`~medallion_pipeline.contracts.RawContractError` before anything is written.
+    """
+    csv_files = {
+        paths.raw / "customers.csv": CUSTOMERS_SCHEMA,
+        paths.raw / "products.csv": PRODUCTS_SCHEMA,
+    }
+    checks = validate_csv_headers({path: s.fieldNames() for path, s in csv_files.items()})
+    for check in checks:
+        if check.extra:
+            logger.warning("Ignoring columns not in the contract: %s", check.describe())
+    customers, products = (_read_csv(spark, path, s) for path, s in csv_files.items())
     orders = spark.read.schema(ORDERS_SCHEMA).json(
         (paths.raw / "orders.jsonl").as_posix(),
         mode="PERMISSIVE",

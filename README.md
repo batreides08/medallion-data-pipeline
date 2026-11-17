@@ -38,7 +38,8 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 ## Key features
 
 - **Quarantine instead of data loss.** Rows that break a rule are stored with the name of every
-  rule they broke. Malformed JSON is kept verbatim.
+  rule they broke. Malformed JSON is kept verbatim. An order that loses every line to quarantine
+  is quarantined too, so Silver never publishes an order without content.
 - **Idempotent runs.** Re-running a batch replaces only that batch, and Silver is rebuilt from all
   of Bronze by default, so repeated deliveries do not create duplicates. With `--incremental`,
   only batches missing from a watermark file (`state/watermark.json`) are cleaned and merged into

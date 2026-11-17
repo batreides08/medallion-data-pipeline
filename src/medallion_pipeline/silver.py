@@ -178,21 +178,37 @@ def clean_order_items(orders: DataFrame, products: DataFrame) -> Split:
     return Split(valid, split.rejected.drop("_known_product_id"))
 
 
+def split_orders_without_valid_items(orders: DataFrame, items: DataFrame) -> Split:
+    """Move orders whose every line was quarantined out of Silver.
+
+    Such an order has no valid line left, so keeping it would publish a sale with no content.
+    It goes to quarantine with the ``has_valid_items`` reason and keeps its raw ``items`` there,
+    while its lines are already in the order_items quarantine with their own reasons.
+    """
+    with_lines = items.select("order_id").distinct()
+    kept = orders.join(with_lines, "order_id", "left_semi")
+    emptied = orders.join(with_lines, "order_id", "left_anti").withColumn(
+        REJECTION_REASONS, F.array(F.lit("has_valid_items"))
+    )
+    return Split(kept, emptied)
+
+
 def build_silver(bronze: dict[str, DataFrame]) -> SilverTables:
     """Turn the three Bronze tables into the four Silver tables."""
     customers = clean_customers(bronze["customers"])
     products = clean_products(bronze["products"])
     orders = clean_orders(bronze["orders"], customers.valid)
     items = clean_order_items(orders.valid, products.valid)
+    complete = split_orders_without_valid_items(orders.valid, items.valid)
     return SilverTables(
         customers=customers.valid,
         products=products.valid,
-        orders=orders.valid.drop("items"),
+        orders=complete.valid.drop("items"),
         order_items=items.valid,
         quarantine={
             "customers": customers.rejected,
             "products": products.rejected,
-            "orders": orders.rejected,
+            "orders": orders.rejected.unionByName(complete.rejected, allowMissingColumns=True),
             "order_items": items.rejected,
         },
     )

@@ -6,7 +6,8 @@ follows the size of the delivery instead of the size of the history.
 
 Merge rules mirror a full rebuild: the newest ``updated_at`` wins for customers and products (so a
 late, older record never overwrites a newer one), the newest ingestion wins for orders, and the
-lines of a re-delivered order replace its previous lines.
+lines of a re-delivered order replace its previous lines. An order whose newest version has no
+valid line leaves Silver for quarantine.
 """
 
 import json
@@ -23,6 +24,7 @@ from medallion_pipeline.silver import (
     clean_orders,
     clean_products,
     keep_latest,
+    split_orders_without_valid_items,
 )
 from medallion_pipeline.tables import read_table
 
@@ -86,10 +88,17 @@ def merge_silver(
 
     orders_new = clean_orders(delta["orders"], customers)
     items_new = clean_order_items(orders_new.valid, products)
+    emptied_new = split_orders_without_valid_items(orders_new.valid, items_new.valid).rejected
+    # An emptied order still competes for "newest version" like a full rebuild does: when it
+    # wins, the order leaves Silver instead of falling back to an older version.
     orders = keep_latest(
         existing.orders.unionByName(orders_new.valid.drop("items")),
         "order_id",
         F.col("_ingested_at").desc(),
+    ).join(
+        emptied_new.select("order_id", "_batch_id", "_ingested_at"),
+        ["order_id", "_batch_id", "_ingested_at"],
+        "left_anti",
     )
     redelivered = orders_new.valid.select("order_id").distinct()
     items = existing.order_items.join(redelivered, "order_id", "left_anti").unionByName(
@@ -99,7 +108,7 @@ def merge_silver(
     rejected_new = {
         "customers": customers_new.rejected,
         "products": products_new.rejected,
-        "orders": orders_new.rejected,
+        "orders": orders_new.rejected.unionByName(emptied_new, allowMissingColumns=True),
         "order_items": items_new.rejected,
     }
     # Replaying a batch must not duplicate its quarantined rows.

@@ -40,15 +40,16 @@ class Task:
 
 def run_tasks(
     tasks: list[Task],
-    policy: RetryPolicy = RetryPolicy(),  # noqa: B008 - frozen, safe as a default
+    policy: RetryPolicy | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
     """Run ``tasks`` in order and return the number of attempts each one needed.
 
     A failing task is retried up to ``policy.retries`` times. When it still fails, or raises an
     exception in its ``no_retry`` list (such as a failed quality gate, which a retry cannot fix),
-    the exception propagates and later tasks do not run.
+    the exception propagates and later tasks do not run. Without a ``policy`` nothing is retried.
     """
+    policy = policy or RetryPolicy()
     attempts: dict[str, int] = {}
     for task in tasks:
         for attempt in range(1, policy.retries + 2):

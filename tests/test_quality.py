@@ -8,6 +8,7 @@ from medallion_pipeline.quality import (
     DataQualityError,
     assert_all_passed,
     check_not_null,
+    check_orders_have_items,
     check_references,
     check_rejection_rates,
     check_revenue_reconciles,
@@ -39,6 +40,18 @@ def test_check_references(spark: SparkSession) -> None:
 
     assert not check_references(child, parent, "id", "child->parent").passed
     assert check_references(parent, child, "id", "parent->child").passed
+
+
+def test_check_orders_have_items(spark: SparkSession) -> None:
+    orders = spark.createDataFrame([("O1",), ("O2",)], "order_id string")
+    items = spark.createDataFrame([("O1", 1)], "order_id string, line_number int")
+
+    result = check_orders_have_items(SilverTables(orders, orders, orders, items, quarantine={}))
+
+    assert not result.passed
+    assert result.detail == "1 order(s) without a valid line"
+    complete = SilverTables(orders, orders, orders.filter("order_id = 'O1'"), items, quarantine={})
+    assert check_orders_have_items(complete).passed
 
 
 def _reconciliation(spark: SparkSession, daily_total: str):

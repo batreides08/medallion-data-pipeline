@@ -36,7 +36,28 @@ def test_expected_counts_account_for_every_order(tmp_path: Path) -> None:
         + cfg.orphan_customer_orders
         + cfg.invalid_status_orders
         + cfg.invalid_timestamp_orders
+        + cfg.no_valid_item_orders
     )
+
+
+def test_expected_counts_account_for_every_order_line(tmp_path: Path) -> None:
+    cfg = GenerationConfig()
+
+    expected = generate_raw_data(tmp_path, cfg)
+
+    lines = []
+    for line in (tmp_path / "orders.jsonl").read_text(encoding="utf-8").splitlines():
+        try:
+            lines.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    unique = {order["order_id"]: order for order in lines}
+    bad_lines = sum(
+        1 for order in unique.values() for item in order["items"] if item["quantity"] <= 0
+    )
+    emptied = [o for o in unique.values() if all(i["quantity"] <= 0 for i in o["items"])]
+    assert bad_lines == expected.rejected_order_items
+    assert len(emptied) == cfg.no_valid_item_orders
 
 
 def test_order_file_contains_duplicates_and_malformed_lines(tmp_path: Path) -> None:

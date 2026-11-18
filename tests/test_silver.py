@@ -7,10 +7,12 @@ from conftest import bronze_frame
 from medallion_pipeline.silver import (
     REJECTION_REASONS,
     apply_rules,
+    build_silver,
     clean_customers,
     clean_order_items,
     clean_orders,
     clean_products,
+    split_orders_without_valid_items,
 )
 
 CUSTOMER_COLUMNS = ["customer_id", "full_name", "email", "country", "updated_at"]
@@ -171,3 +173,52 @@ def test_order_items_reject_lines_not_the_order(spark: SparkSession) -> None:
 
     assert split.valid.count() == 1
     assert sorted(_reasons(split)) == ["known_product", "quantity_positive", "quantity_positive"]
+
+
+def test_order_without_valid_lines_moves_to_quarantine(spark: SparkSession) -> None:
+    orders = clean_orders(
+        _orders(
+            spark,
+            [
+                ("O1", "C1", "placed", "2025-03-01T10:00:00Z", ITEMS, None),
+                ("O2", "C1", "placed", "2025-03-01T10:00:00Z", [("P1", "0", "1.00")], None),
+            ],
+        ),
+        _customers(spark, "C1"),
+    ).valid
+    items = clean_order_items(orders, _products(spark, "P1"))
+
+    split = split_orders_without_valid_items(orders, items.valid)
+
+    assert [row["order_id"] for row in split.valid.collect()] == ["O1"]
+    emptied = split.rejected.first()
+    assert (emptied["order_id"], emptied[REJECTION_REASONS]) == ("O2", ["has_valid_items"])
+    assert emptied["items"][0]["quantity"] == "0"  # raw lines kept for inspection
+
+
+def test_build_silver_publishes_no_order_without_lines(spark: SparkSession) -> None:
+    ts = "2025-03-01T10:00:00Z"
+    bronze = {
+        "customers": bronze_frame(
+            spark, CUSTOMER_COLUMNS, [("C1", "N", "c1@example.com", "cr", ts)]
+        ),
+        "products": bronze_frame(spark, PRODUCT_COLUMNS, [("P1", "N", "Home", "1.00", ts)]),
+        "orders": _orders(
+            spark,
+            [
+                ("O1", "C1", "placed", ts, ITEMS, None),
+                ("O2", "C1", "placed", ts, [("P404", "1", "1.00"), ("P1", "-1", "1.00")], None),
+                ("O3", "C1", "lost", ts, ITEMS, None),
+            ],
+        ),
+    }
+
+    silver = build_silver(bronze)
+
+    assert [row["order_id"] for row in silver.orders.collect()] == ["O1"]
+    assert "items" not in silver.orders.columns
+    quarantined = {
+        row["order_id"]: row[REJECTION_REASONS] for row in silver.quarantine["orders"].collect()
+    }
+    assert quarantined == {"O2": ["has_valid_items"], "O3": ["known_status"]}
+    assert silver.quarantine["order_items"].count() == 2

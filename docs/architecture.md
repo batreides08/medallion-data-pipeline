@@ -66,7 +66,7 @@ flowchart TD
 | --- | --- | --- |
 | `customers` | `customer_id` | ID present, valid email, parsable `updated_at`. Newest version wins. |
 | `products` | `product_id` | ID present, non-negative price, parsable `updated_at`. Newest version wins. |
-| `orders` | `order_id` | Well-formed record, ID present, known customer, known status, parsable timestamp, at least one item. |
+| `orders` | `order_id` | Well-formed record, ID present, known customer, known status, parsable timestamp, at least one item, at least one valid line (`has_valid_items`). |
 | `order_items` | `order_id`, `line_number` | Known product, positive quantity, non-negative price. |
 
 A rule that evaluates to NULL counts as broken. Silver is rebuilt from every Bronze batch on each
@@ -87,7 +87,11 @@ from a replayed batch stays in Silver. Atomic publishing (issue #8) is the plann
 partial writes (now addressed by atomic publishing, see Orchestration).
 
 A rejected line does not reject its order. The order stays valid and only the line moves to
-quarantine, because the rest of the sale really happened.
+quarantine, because the rest of the sale really happened. The exception is an order whose every
+line is rejected: nothing of the sale is left, so the order also moves to quarantine with the
+reason `has_valid_items` and keeps its raw `items` there for inspection. The check runs on the
+newest version of the order, so a re-delivery whose lines are all bad removes the order from Silver
+instead of falling back to an older version, in full and incremental runs alike.
 
 ### Gold
 
@@ -144,6 +148,7 @@ After Gold is built, the gate checks:
 - Primary key uniqueness on Silver tables and Gold marts.
 - Required fields are populated.
 - Referential integrity between Silver tables.
+- Completeness: every Silver order has at least one line (`completeness:orders_have_items`).
 - Reconciliation: the three marts and the Silver lines report the same revenue, using exact decimal
   arithmetic.
 - Rejection rate: for each entity, the share of this batch's rows that went to quarantine must not
@@ -189,6 +194,7 @@ The report is written first, so a failed run still leaves evidence. The pipeline
 - `VACUUM` is a separate command, not part of `run`: old versions take disk space until it is run
   (for example from the same cron schedule). It only removes data files; the transaction log
   still lists the old versions, and reading one that was vacuumed fails.
-- Orders that lose every line to quarantine stay in Silver without items and contribute no revenue.
+- An order that keeps some of its lines is published with the remaining ones, so its revenue
+  counts only those lines. The rejected lines are in quarantine.
 - A failed gate leaves its candidate tables in `state/candidate` for inspection until the next run.
   Live data is not changed.

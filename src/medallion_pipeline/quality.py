@@ -47,6 +47,14 @@ def check_references(
     return CheckResult(f"references:{relationship}", orphans == 0, f"{orphans} orphan row(s)")
 
 
+def check_orders_have_items(silver: SilverTables) -> CheckResult:
+    """Every published order must keep at least one valid line."""
+    empty = silver.orders.join(silver.order_items, "order_id", "left_anti").count()
+    return CheckResult(
+        "completeness:orders_have_items", empty == 0, f"{empty} order(s) without a valid line"
+    )
+
+
 def _total(df: DataFrame, column: str):
     return df.agg(F.sum(column).alias("total")).first()["total"] or 0
 
@@ -81,6 +89,7 @@ def run_checks(silver: SilverTables, gold: dict[str, DataFrame]) -> list[CheckRe
         check_references(
             silver.order_items, silver.products, "product_id", "order_items->products"
         ),
+        check_orders_have_items(silver),
         check_revenue_reconciles(silver, gold),
     ]
 

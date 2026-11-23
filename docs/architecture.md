@@ -81,10 +81,15 @@ customers and products, newest ingestion wins for orders, and a re-delivered ord
 lines. Quarantine rows of a replayed batch are replaced, not duplicated. Merged tables are written
 to `state/staging` and swapped in, because Spark cannot overwrite a path it is reading.
 
-Known limits: an order rejected earlier for an unknown customer is not re-evaluated when that
-customer arrives in a later batch (a full rebuild would accept it), and a record that disappears
-from a replayed batch stays in Silver. Atomic publishing (issue #8) is the planned fix for
-partial writes (now addressed by atomic publishing, see Orchestration).
+Late-arriving dimensions: before merging, `late_arriving_orders` finds orders in quarantine that
+were rejected for `known_customer` whose customer is now in Silver, and orders with a line rejected
+for `known_product` whose product is now in Silver. Every Bronze version of those orders is cleaned
+again together with the new batches, their previous Silver and quarantine rows are replaced, and the
+newest valid version wins, as in a full rebuild. An order whose dimension is still missing stays in
+quarantine and is checked again on the next run. Tests compare the merged result with a full
+rebuild for a late customer, a late product and a late customer that makes a newer version win.
+
+Known limit: a record that disappears from a replayed batch stays in Silver.
 
 A rejected line does not reject its order. The order stays valid and only the line moves to
 quarantine, because the rest of the sale really happened. The exception is an order whose every

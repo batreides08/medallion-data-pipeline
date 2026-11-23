@@ -111,3 +111,136 @@ def test_redelivered_order_without_valid_lines_leaves_silver(spark: SparkSession
         assert [(r["order_id"], r[REJECTION_REASONS]) for r in quarantined] == [
             ("O1", ["has_valid_items"])
         ]
+
+
+def _in_batch(df, batch_id: str, day: int):
+    return df.withColumn("_batch_id", F.lit(batch_id)).withColumn(
+        "_ingested_at", F.lit(datetime(2026, 1, day))
+    )
+
+
+def _silver_rows(silver) -> dict[str, list[tuple]]:
+    """Every Silver and quarantine table as sorted rows, for comparing two builds."""
+    tables = {**silver.as_dict(), **{f"q_{k}": v for k, v in silver.quarantine.items()}}
+    rows = {}
+    for name, df in tables.items():
+        df = df.drop("items", "_corrupt_record")
+        rows[name] = sorted(
+            tuple(str(v) for v in r) for r in df.select(*sorted(df.columns)).collect()
+        )
+    return rows
+
+
+def _late_arrival_bronze(spark: SparkSession, batch_2: dict) -> tuple[dict, dict]:
+    """Batch 1 has O1 for customer C2 and O2 with a line for product P2, neither known yet."""
+    ts = "2025-03-01T10:00:00Z"
+    batch_1 = {
+        "customers": bronze_frame(
+            spark, CUSTOMER_COLUMNS, [("C1", "N", "c1@example.com", "cr", ts)]
+        ),
+        "products": bronze_frame(spark, PRODUCT_COLUMNS, [("P1", "N", "Home", "1.00", ts)]),
+        "orders": _orders(
+            spark,
+            [
+                ("O1", "C2", "placed", ts, ITEMS, None),
+                ("O2", "C1", "placed", ts, [("P1", "1", "1.00"), ("P2", "3", "2.00")], None),
+            ],
+        ),
+    }
+    bronze = {name: df.unionByName(batch_2[name]) for name, df in batch_1.items()}
+    return batch_1, bronze
+
+
+def test_late_arriving_customer_and_product_are_reprocessed(spark: SparkSession) -> None:
+    ts = "2025-03-02T10:00:00Z"
+    batch_2 = {
+        "customers": _in_batch(
+            bronze_frame(spark, CUSTOMER_COLUMNS, [("C2", "M", "c2@example.com", "cr", ts)]),
+            "batch-2",
+            2,
+        ),
+        "products": _in_batch(
+            bronze_frame(spark, PRODUCT_COLUMNS, [("P2", "M", "Home", "2.00", ts)]), "batch-2", 2
+        ),
+        "orders": _in_batch(_orders(spark, []), "batch-2", 2),
+    }
+    batch_1, bronze = _late_arrival_bronze(spark, batch_2)
+    first = build_silver(batch_1)
+    assert [r["order_id"] for r in first.quarantine["orders"].collect()] == ["O1"]
+    assert first.order_items.count() == 1
+
+    merged = merge_silver(first, bronze, {"batch-2"})
+
+    assert sorted(r["order_id"] for r in merged.orders.collect()) == ["O1", "O2"]
+    assert merged.quarantine["orders"].count() == 0
+    assert merged.quarantine["order_items"].count() == 0
+    assert sorted((r["order_id"], r["line_number"]) for r in merged.order_items.collect()) == [
+        ("O1", 1),
+        ("O2", 1),
+        ("O2", 2),
+    ]
+    assert _silver_rows(merged) == _silver_rows(build_silver(bronze))
+
+
+def test_orders_stay_quarantined_until_their_dimension_arrives(spark: SparkSession) -> None:
+    # Batch 2 brings an unrelated customer only, so nothing must change for O1 and O2.
+    ts = "2025-03-02T10:00:00Z"
+    batch_2 = {
+        "customers": _in_batch(
+            bronze_frame(spark, CUSTOMER_COLUMNS, [("C3", "M", "c3@example.com", "cr", ts)]),
+            "batch-2",
+            2,
+        ),
+        "products": _in_batch(
+            bronze_frame(spark, PRODUCT_COLUMNS, [("P1", "N", "Home", "1.00", ts)]), "batch-2", 2
+        ),
+        "orders": _in_batch(_orders(spark, []), "batch-2", 2),
+    }
+    batch_1, bronze = _late_arrival_bronze(spark, batch_2)
+
+    merged = merge_silver(build_silver(batch_1), bronze, {"batch-2"})
+
+    assert [r["order_id"] for r in merged.orders.collect()] == ["O2"]
+    assert [r["order_id"] for r in merged.quarantine["orders"].collect()] == ["O1"]
+    assert [r["product_id"] for r in merged.quarantine["order_items"].collect()] == ["P2"]
+    assert _silver_rows(merged) == _silver_rows(build_silver(bronze))
+
+
+def test_late_customer_makes_newer_order_version_win(spark: SparkSession) -> None:
+    # O1 is valid in batch 1; batch 2 re-delivers it for unknown C2 (quarantined, so the old
+    # version stays); batch 3 brings C2, so the batch-2 version must now replace it.
+    ts = "2025-03-01T10:00:00Z"
+    batch_1 = {
+        "customers": bronze_frame(
+            spark, CUSTOMER_COLUMNS, [("C1", "N", "c1@example.com", "cr", ts)]
+        ),
+        "products": bronze_frame(spark, PRODUCT_COLUMNS, [("P1", "N", "Home", "1.00", ts)]),
+        "orders": _orders(spark, [("O1", "C1", "placed", ts, ITEMS, None)]),
+    }
+    batch_2 = {
+        "customers": _in_batch(batch_1["customers"], "batch-2", 2),
+        "products": _in_batch(batch_1["products"], "batch-2", 2),
+        "orders": _in_batch(
+            _orders(spark, [("O1", "C2", "shipped", ts, [("P1", "5", "1.00")], None)]),
+            "batch-2",
+            2,
+        ),
+    }
+    c2 = bronze_frame(spark, CUSTOMER_COLUMNS, [("C2", "M", "c2@example.com", "cr", ts)])
+    batch_3 = {
+        "customers": _in_batch(c2, "batch-3", 3),
+        "products": _in_batch(batch_1["products"], "batch-3", 3),
+        "orders": _in_batch(_orders(spark, []), "batch-3", 3),
+    }
+    upto_2 = {n: batch_1[n].unionByName(batch_2[n]) for n in batch_1}
+    bronze = {n: upto_2[n].unionByName(batch_3[n]) for n in upto_2}
+
+    after_2 = merge_silver(build_silver(batch_1), upto_2, {"batch-2"})
+    assert [(r["customer_id"], r["status"]) for r in after_2.orders.collect()] == [("C1", "placed")]
+
+    merged = merge_silver(after_2, bronze, {"batch-3"})
+
+    assert [(r["customer_id"], r["status"]) for r in merged.orders.collect()] == [("C2", "shipped")]
+    assert [r["quantity"] for r in merged.order_items.collect()] == [5]
+    assert merged.quarantine["orders"].count() == 0
+    assert _silver_rows(merged) == _silver_rows(build_silver(bronze))

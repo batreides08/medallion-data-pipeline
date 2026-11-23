@@ -43,7 +43,9 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
 - **Idempotent runs.** Re-running a batch replaces only that batch, and Silver is rebuilt from all
   of Bronze by default, so repeated deliveries do not create duplicates. With `--incremental`,
   only batches missing from a watermark file (`state/watermark.json`) are cleaned and merged into
-  Silver; a test checks the result equals a full rebuild.
+  Silver; a test checks the result equals a full rebuild. Orders quarantined because their
+  customer or product had not arrived yet are re-evaluated once it does, so late-arriving
+  dimensions are not lost in incremental mode.
 - **Column contracts on raw CSV files.** Spark maps CSV columns to a schema by position and only
   logs a warning when the header disagrees, so a delivery with reordered columns would silently put
   emails in `full_name`. Bronze checks each header first and then reads columns by name: reordered

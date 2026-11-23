@@ -83,6 +83,14 @@ def test_run_persists_every_layer_and_writes_report(
     }
     names = {c["name"] for c in report["checks"]}
     assert {"scd2:orders_matched_to_version", "unique:gold.dim_customer"} <= names
+    tasks = report["tasks"]
+    assert [t["name"] for t in tasks] == ["bronze", "silver", "gold", "quality", "publish"]
+    assert all(t["status"] == "succeeded" and t["attempts"] == 1 for t in tasks)
+    assert all(t["duration_seconds"] > 0 for t in tasks)
+    assert report["total_task_seconds"] == pytest.approx(
+        sum(t["duration_seconds"] for t in tasks), abs=0.01
+    )
+    assert [run.name for run in result.task_runs] == [t["name"] for t in tasks]
     assert result.row_counts["gold.dim_customer"] >= expected.silver_customers
     assert result.row_counts["gold.order_customer_version"] == expected.silver_orders
 
@@ -147,6 +155,14 @@ def test_failed_quality_gate_still_writes_report(
     report = json.loads((paths.reports / "run_batch-1.json").read_text(encoding="utf-8"))
     checks = {check["name"]: check["passed"] for check in report["checks"]}
     assert checks["reconciliation:revenue"] is False
+    # Publish never ran, and the gate is recorded as the task that stopped the run.
+    statuses = {task["name"]: task["status"] for task in report["tasks"]}
+    assert statuses == {
+        "bronze": "succeeded",
+        "silver": "succeeded",
+        "gold": "succeeded",
+        "quality": "failed",
+    }
 
 
 @pytest.mark.parquet_io
@@ -256,6 +272,8 @@ def test_transient_failure_in_a_layer_is_retried(
     result = run_pipeline(spark, paths, "batch-1", retry_policy=RetryPolicy(1, 0))
 
     assert result.task_attempts == {"bronze": 1, "silver": 1, "gold": 2, "quality": 1, "publish": 1}
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert {t["name"]: t["attempts"] for t in report["tasks"]} == result.task_attempts
     _assert_matches_generator(result.row_counts, expected)
 
 

@@ -12,7 +12,7 @@ from medallion_pipeline.config import ENTITIES, LakePaths
 from medallion_pipeline.data_generator import generate_raw_data
 from medallion_pipeline.incremental import merge_silver, read_watermark, write_watermark
 from medallion_pipeline.pipeline import run_pipeline
-from medallion_pipeline.silver import REJECTION_REASONS, build_silver
+from medallion_pipeline.silver import REJECTION_REASONS, SilverTables, build_silver
 from medallion_pipeline.tables import read_table
 from test_silver import CUSTOMER_COLUMNS, ITEMS, PRODUCT_COLUMNS, _orders
 
@@ -131,6 +131,14 @@ def _silver_rows(silver) -> dict[str, list[tuple]]:
     return rows
 
 
+def _materialize(silver: SilverTables) -> SilverTables:
+    """Cut the lineage, as a real run does by writing Silver and reading it back."""
+    return SilverTables(
+        **{name: df.localCheckpoint() for name, df in silver.as_dict().items()},
+        quarantine={name: df.localCheckpoint() for name, df in silver.quarantine.items()},
+    )
+
+
 def _late_arrival_bronze(spark: SparkSession, batch_2: dict) -> tuple[dict, dict]:
     """Batch 1 has O1 for customer C2 and O2 with a line for product P2, neither known yet."""
     ts = "2025-03-01T10:00:00Z"
@@ -235,7 +243,7 @@ def test_late_customer_makes_newer_order_version_win(spark: SparkSession) -> Non
     upto_2 = {n: batch_1[n].unionByName(batch_2[n]) for n in batch_1}
     bronze = {n: upto_2[n].unionByName(batch_3[n]) for n in upto_2}
 
-    after_2 = merge_silver(build_silver(batch_1), upto_2, {"batch-2"})
+    after_2 = _materialize(merge_silver(build_silver(batch_1), upto_2, {"batch-2"}))
     assert [(r["customer_id"], r["status"]) for r in after_2.orders.collect()] == [("C1", "placed")]
 
     merged = merge_silver(after_2, bronze, {"batch-3"})

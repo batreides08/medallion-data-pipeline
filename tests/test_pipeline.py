@@ -43,7 +43,7 @@ def test_all_layers_in_memory_match_generator_truth(
     _assert_matches_generator(count_rows(silver, gold), expected)
     checks = run_checks(silver, gold)
     assert_all_passed(checks)
-    assert len(checks) == 13
+    assert len(checks) == 14
 
 
 def test_cli_run_without_raw_data_fails_clearly(tmp_path: Path) -> None:

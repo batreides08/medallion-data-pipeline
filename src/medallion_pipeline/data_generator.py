@@ -44,6 +44,7 @@ class GenerationConfig:
     invalid_timestamp_orders: int = 5
     duplicated_orders: int = 20
     invalid_quantity_orders: int = 15
+    no_valid_item_orders: int = 5
 
 
 @dataclass(frozen=True)
@@ -150,10 +151,17 @@ def _build_order(
     }
 
 
+def _extra_line(order: dict, products: list[dict[str, str]]) -> dict:
+    """A valid line for a product the order does not contain yet."""
+    used = {item["product_id"] for item in order["items"]}
+    product = next(p for p in products if p["product_id"] not in used)
+    return {"product_id": product["product_id"], "quantity": 1, "unit_price": product["list_price"]}
+
+
 def _build_order_lines(
     cfg: GenerationConfig, rng: random.Random, products
-) -> tuple[list, int, int]:
-    """Return raw JSONL lines plus the expected valid order and order item counts."""
+) -> tuple[list, int, int, int]:
+    """Return raw JSONL lines plus the expected valid orders, valid items and rejected items."""
     orders = [_build_order(n, cfg, rng, products) for n in range(1, cfg.n_orders + 1)]
 
     # Each defect lands on its own order, which keeps the expected counts exact.
@@ -165,6 +173,7 @@ def _build_order_lines(
         ("invalid_timestamp", cfg.invalid_timestamp_orders),
         ("duplicated", cfg.duplicated_orders),
         ("invalid_quantity", cfg.invalid_quantity_orders),
+        ("no_valid_items", cfg.no_valid_item_orders),
     )
     shuffled = rng.sample(range(cfg.n_orders), sum(count for _, count in kinds))
     defects: dict[int, str] = {}
@@ -175,6 +184,7 @@ def _build_order_lines(
     lines = []
     valid_orders = 0
     valid_items = 0
+    rejected_items = 0
     for index, order in enumerate(orders):
         defect = defects.get(index)
         if defect == "malformed":
@@ -188,17 +198,26 @@ def _build_order_lines(
             order["status"] = "lost_in_space"
         elif defect == "invalid_timestamp":
             order["order_ts"] = "not-a-date"
+        elif defect == "no_valid_items":
+            # The header is fine but every line is bad, so the whole order ends in quarantine.
+            for item in order["items"]:
+                item["quantity"] = rng.choice((0, -1))
+            rejected_items += len(order["items"])
         else:
+            if defect == "invalid_quantity" and len(order["items"]) == 1:
+                # Keep one valid line, so only the bad line is rejected and the order stays.
+                order["items"].append(_extra_line(order, products[: cfg.n_products]))
             valid_orders += 1
             valid_items += len(order["items"])
             if defect == "invalid_quantity":
                 order["items"][0]["quantity"] = rng.choice((0, -1))
                 valid_items -= 1
+                rejected_items += 1
         lines.append(json.dumps(order))
         if defect == "duplicated":
             lines.append(json.dumps(order))
 
-    return rng.sample(lines, len(lines)), valid_orders, valid_items
+    return rng.sample(lines, len(lines)), valid_orders, valid_items, rejected_items
 
 
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]]) -> None:
@@ -216,7 +235,7 @@ def generate_raw_data(raw_dir: Path, cfg: GenerationConfig | None = None) -> Exp
 
     customers = _build_customers(cfg, rng)
     products = _build_products(cfg, rng)
-    lines, valid_orders, valid_items = _build_order_lines(cfg, rng, products)
+    lines, valid_orders, valid_items, rejected_items = _build_order_lines(cfg, rng, products)
 
     _write_csv(raw_dir / "customers.csv", CUSTOMER_FIELDS, rng.sample(customers, len(customers)))
     _write_csv(raw_dir / "products.csv", PRODUCT_FIELDS, rng.sample(products, len(products)))
@@ -230,5 +249,5 @@ def generate_raw_data(raw_dir: Path, cfg: GenerationConfig | None = None) -> Exp
         rejected_customers=cfg.invalid_email_customers,
         rejected_products=cfg.invalid_price_products,
         rejected_orders=cfg.n_orders - valid_orders,
-        rejected_order_items=cfg.invalid_quantity_orders,
+        rejected_order_items=rejected_items,
     )

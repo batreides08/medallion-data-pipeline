@@ -1,7 +1,7 @@
 import pytest
 
 from medallion_pipeline.cli import main
-from medallion_pipeline.orchestrator import RetryPolicy, Task, run_tasks
+from medallion_pipeline.orchestrator import RetryPolicy, Task, TaskRun, run_tasks
 
 
 class Flaky:
@@ -69,6 +69,95 @@ def test_no_retries_by_default() -> None:
     with pytest.raises(OSError, match="transient"):
         run_tasks([Task("t", flaky)])
     assert flaky.calls == 1
+
+
+class FakeClock:
+    """A clock that advances only when a task calls ``tick``, so durations are exact."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_each_task_reports_its_duration_and_outcome() -> None:
+    clock = FakeClock()
+    runs: list[TaskRun] = []
+    tasks = [Task("fast", lambda: clock.tick(0.5)), Task("slow", lambda: clock.tick(4.0))]
+
+    run_tasks(tasks, on_task_end=runs.append, clock=clock)
+
+    assert runs == [TaskRun("fast", True, 1, 0.5), TaskRun("slow", True, 1, 4.0)]
+
+
+def test_duration_adds_up_attempts_but_not_backoff_waits() -> None:
+    clock = FakeClock()
+    calls = 0
+
+    def flaky() -> None:
+        nonlocal calls
+        calls += 1
+        clock.tick(1.0)
+        if calls < 3:
+            raise OSError("transient")
+
+    runs: list[TaskRun] = []
+    run_tasks(
+        [Task("t", flaky)],
+        RetryPolicy(retries=2, base_delay_seconds=10),
+        sleep=clock.tick,  # the wait advances the clock, yet must not be counted
+        on_task_end=runs.append,
+        clock=clock,
+    )
+
+    assert runs == [TaskRun("t", True, 3, 3.0)]
+
+
+def test_failed_tasks_are_reported_before_the_error_propagates() -> None:
+    clock = FakeClock()
+    runs: list[TaskRun] = []
+
+    def gate() -> None:
+        clock.tick(2.0)
+        raise ValueError("gate failed")
+
+    def broken() -> None:
+        clock.tick(0.25)
+        raise OSError("disk")
+
+    with pytest.raises(ValueError):
+        run_tasks(
+            [Task("a", lambda: clock.tick(1.0)), Task("gate", gate, no_retry=(ValueError,))],
+            on_task_end=runs.append,
+            clock=clock,
+        )
+    with pytest.raises(OSError):
+        run_tasks(
+            [Task("broken", broken)],
+            RetryPolicy(retries=1, base_delay_seconds=0),
+            lambda _: None,
+            on_task_end=runs.append,
+            clock=clock,
+        )
+
+    assert runs == [
+        TaskRun("a", True, 1, 1.0),
+        TaskRun("gate", False, 1, 2.0),
+        TaskRun("broken", False, 2, 0.5),
+    ]
+
+
+def test_task_run_serialises_status_and_rounds_duration() -> None:
+    assert TaskRun("silver", False, 2, 1.23456).as_dict() == {
+        "name": "silver",
+        "status": "failed",
+        "attempts": 2,
+        "duration_seconds": 1.235,
+    }
 
 
 @pytest.mark.parametrize("kwargs", [{"retries": -1}, {"base_delay_seconds": -0.1}])

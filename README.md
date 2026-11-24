@@ -61,6 +61,10 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   `state/run_history.jsonl`. Once three passing runs exist, the gate also fails an entity whose
   rejection rate is more than 5 points above the median of recent passing runs, which catches a
   drift that is still under the absolute limit.
+- **Slow-task detection.** The run history also stores how long each task took. A task more than
+  twice as slow as its median over recent passing runs (and at least 5 seconds slower) is logged
+  as a warning and listed under `slow_tasks` in the report, without failing the run.
+  `medallion-pipeline history` prints recent runs with their outcome, time and rejection rates.
 - **Layer tasks with retries.** Bronze, Silver, Gold and the quality gate each run as their own
   task. `--retries N --retry-delay S` retries a failing layer with exponential backoff, while a
   failed quality gate is never retried. The orchestrator is a small standard-library module
@@ -115,6 +119,13 @@ medallion-pipeline run --data-dir data --incremental
 
 With the seeded data, about 5.7% of products are rejected, so this example fails on purpose with
 `rejection_rate:products` and exit code 1.
+
+List recent runs from the history, with gate outcome, total task time, highest rejection rate and
+slowest task:
+
+```bash
+medallion-pipeline history --data-dir data --last 5
+```
 
 Render the dashboard from the Gold marts and open `data/dashboard/index.html`:
 
@@ -178,9 +189,10 @@ src/medallion_pipeline/
 ├── dashboard.py        Static HTML dashboard over the Gold marts
 ├── sql/gold/           One .sql file per mart
 ├── quality.py          Quality gate
+├── history.py          Run history, rejection-rate trend and slow-task detection
 ├── orchestrator.py     Task runner with per-task retries and backoff
 ├── pipeline.py         Defines the layer tasks of one run
-└── cli.py              generate, run, dashboard and vacuum commands
+└── cli.py              generate, run, dashboard, vacuum and history commands
 tests/                  Unit and end-to-end tests
 docs/architecture.md    Design decisions and data model
 ```

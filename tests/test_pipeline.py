@@ -10,6 +10,7 @@ from medallion_pipeline.cli import main
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, ENTITIES, LakePaths
 from medallion_pipeline.data_generator import ExpectedCounts, generate_raw_data
 from medallion_pipeline.gold import build_gold
+from medallion_pipeline.history import find_slow_tasks, read_history
 from medallion_pipeline.incremental import read_watermark
 from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import batch_row_counts, count_rows, run_pipeline
@@ -91,6 +92,11 @@ def test_run_persists_every_layer_and_writes_report(
         sum(t["duration_seconds"] for t in tasks), abs=0.01
     )
     assert [run.name for run in result.task_runs] == [t["name"] for t in tasks]
+    assert report["slow_tasks"] == []
+    # The history keeps the time of every task, including publish, which ran after the gate.
+    (recorded,) = read_history(paths)
+    assert recorded["passed"] is True
+    assert recorded["task_seconds"] == {t["name"]: t["duration_seconds"] for t in tasks}
     assert result.row_counts["gold.dim_customer"] >= expected.silver_customers
     assert result.row_counts["gold.order_customer_version"] == expected.silver_orders
 
@@ -163,6 +169,37 @@ def test_failed_quality_gate_still_writes_report(
         "gold": "succeeded",
         "quality": "failed",
     }
+    # The failed run is still in the history, with only the tasks that succeeded timed.
+    (recorded,) = read_history(paths)
+    assert recorded["passed"] is False
+    assert set(recorded["task_seconds"]) == {"bronze", "silver", "gold"}
+
+
+@pytest.mark.parquet_io
+def test_a_task_much_slower_than_usual_is_reported_but_does_not_fail_the_run(
+    spark: SparkSession,
+    fresh_lake: tuple[LakePaths, ExpectedCounts],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, _ = fresh_lake
+    history = [
+        {"batch_id": f"old-{i}", "passed": True, "task_seconds": {"gold": 0.001}} for i in range(3)
+    ]
+    monkeypatch.setattr("medallion_pipeline.pipeline.read_history", lambda _: history)
+    monkeypatch.setattr("medallion_pipeline.pipeline.find_slow_tasks", _no_minimum_slow_tasks)
+
+    result = run_pipeline(spark, paths, "batch-1")
+
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert [task["name"] for task in report["slow_tasks"]] == ["gold"]
+    assert report["slow_tasks"][0]["median_seconds"] == pytest.approx(0.001)
+    assert report["slow_tasks"][0]["baseline_runs"] == 3
+    assert [task.name for task in result.slow_tasks] == ["gold"]
+    assert all(check["passed"] for check in report["checks"])
+
+
+def _no_minimum_slow_tasks(task_seconds, history):
+    return find_slow_tasks(task_seconds, history, min_seconds=0)
 
 
 @pytest.mark.parquet_io

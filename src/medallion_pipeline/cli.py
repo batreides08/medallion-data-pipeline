@@ -1,4 +1,4 @@
-"""Command line interface: ``medallion-pipeline generate|run|dashboard|vacuum``."""
+"""Command line interface: ``medallion-pipeline generate|run|dashboard|vacuum|history``."""
 
 import argparse
 import logging
@@ -10,6 +10,7 @@ from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.contracts import RawContractError
 from medallion_pipeline.dashboard import build_dashboard
 from medallion_pipeline.data_generator import GenerationConfig, generate_raw_data
+from medallion_pipeline.history import format_history, read_history
 from medallion_pipeline.maintenance import DEFAULT_RETENTION_HOURS, vacuum_lake
 from medallion_pipeline.orchestrator import RetryPolicy
 from medallion_pipeline.pipeline import run_pipeline
@@ -34,6 +35,13 @@ def _non_negative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
+    return number
+
+
+def _positive_int(value: str) -> int:
+    number = _non_negative_int(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("must be at least 1")
     return number
 
 
@@ -105,6 +113,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="permit a window under the default; only when nothing else reads the lake",
     )
+
+    history = commands.add_parser(
+        "history", help="show recorded runs: gate outcome, task time and rejection rates"
+    )
+    history.add_argument("--data-dir", type=Path, default=Path("data"))
+    history.add_argument(
+        "--last", type=_positive_int, default=10, help="number of recent runs (default: 10)"
+    )
     return parser
 
 
@@ -116,6 +132,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "generate":
         expected = generate_raw_data(paths.raw, GenerationConfig(seed=args.seed))
         logging.info("Raw data written to %s; expected counts: %s", paths.raw, asdict(expected))
+        return 0
+
+    if args.command == "history":
+        runs = read_history(paths)
+        if not runs:
+            logging.error("No run history in %s; run the run command first", paths.state)
+            return 2
+        print(format_history(runs, args.last))
         return 0
 
     if args.command == "dashboard":

@@ -139,6 +139,16 @@ before `publish` runs, so the pipeline rewrites it once the chain stops; a faile
 publish is therefore recorded with the timings of every task that ran. A failure in bronze, silver or
 gold happens before any report exists and is only logged.
 
+Once the chain stops, the run is appended to `state/run_history.jsonl` together with
+`task_seconds`, the duration of every task that succeeded (a failed task's partial time would
+skew the baseline). Each of those tasks is then compared with its median over the last 20
+passing runs: a task more than 2 times slower than that median, and at least 5 seconds slower,
+is logged as a warning and listed in the report under `slow_tasks` with its median and the number
+of runs behind it. The 5-second floor keeps sub-second tasks from being flagged for noise.
+A slow task is a warning, not a gate failure: wall-clock time depends on the load of the machine,
+and data that passed every check is still correct. `medallion-pipeline history` prints the recent
+runs with their gate outcome, total task time, highest rejection rate and slowest task.
+
 ### Atomic publishing
 
 Silver and Gold are Delta tables. `silver_task` and `gold_task` write to `state/candidate`, the
@@ -207,8 +217,9 @@ The report is written first, so a failed run still leaves evidence. The pipeline
   (for example from the same cron schedule). It only removes data files; the transaction log
   still lists the old versions, and reading one that was vacuumed fails.
 - Task durations are wall-clock time on the machine that ran the job. They are comparable between
-  runs of the same environment, not across machines, and the run history does not yet store them,
-  so a slowdown is visible per report rather than flagged automatically.
+  runs of the same environment, not across machines, so moving the job to a slower machine flags
+  every task until 20 new runs form the baseline. A slowdown is only a warning and does not alert
+  anyone outside the log and the report.
 - An order that keeps some of its lines is published with the remaining ones, so its revenue
   counts only those lines. The rejected lines are in quarantine.
 - A failed gate leaves its candidate tables in `state/candidate` for inspection until the next run.

@@ -15,7 +15,13 @@ from medallion_pipeline.bronze import read_bronze, read_raw, write_bronze
 from medallion_pipeline.config import DEFAULT_MAX_REJECTION_RATE, LakePaths
 from medallion_pipeline.contracts import RawContractError
 from medallion_pipeline.gold import build_gold, write_gold
-from medallion_pipeline.history import append_run, check_rejection_trend, read_history
+from medallion_pipeline.history import (
+    SlowTask,
+    append_run,
+    check_rejection_trend,
+    find_slow_tasks,
+    read_history,
+)
 from medallion_pipeline.incremental import (
     bronze_batches,
     merge_silver,
@@ -50,6 +56,7 @@ class RunResult:
     report_path: Path
     task_attempts: dict[str, int] = field(default_factory=dict)
     task_runs: list[TaskRun] = field(default_factory=list)
+    slow_tasks: list[SlowTask] = field(default_factory=list)
 
 
 def default_batch_id() -> str:
@@ -90,8 +97,37 @@ def write_report(result: RunResult) -> None:
         "checks": [check.as_dict() for check in result.checks],
         "tasks": [run.as_dict() for run in result.task_runs],
         "total_task_seconds": round(sum(run.duration_seconds for run in result.task_runs), 3),
+        "slow_tasks": [task.as_dict() for task in result.slow_tasks],
     }
     result.report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def _finish_run(paths: LakePaths, state: dict[str, Any], task_runs: list[TaskRun]) -> None:
+    result: RunResult = state["result"]
+    task_seconds = {run.name: round(run.duration_seconds, 3) for run in task_runs if run.succeeded}
+    # A replayed batch replaces its own entry, so it is not part of its own baseline.
+    earlier = [run for run in read_history(paths) if run.get("batch_id") != result.batch_id]
+    slow = find_slow_tasks(task_seconds, earlier)
+    for task in slow:
+        logger.warning(
+            "Task %s took %.1fs, more than %.0fx its median of %.1fs over %d passing runs",
+            task.name,
+            task.seconds,
+            task.seconds / task.median_seconds if task.median_seconds else float("inf"),
+            task.median_seconds,
+            task.baseline_runs,
+        )
+    result = replace(result, task_runs=list(task_runs), slow_tasks=slow)
+    state["result"] = result
+    write_report(result)
+    append_run(
+        paths,
+        result.batch_id,
+        result.row_counts,
+        result.batch_rejection_rates,
+        all(check.passed for check in result.checks),
+        task_seconds,
+    )
 
 
 def run_pipeline(
@@ -118,7 +154,10 @@ def run_pipeline(
 
     Each layer (bronze, silver, gold, quality, publish) is a task retried according to
     ``retry_policy``. The report lists every task that ran with its outcome, attempts and duration,
-    so a slow layer is visible run by run.
+    so a slow layer is visible run by run. The run history keeps the time of every task that
+    succeeded, and a task much slower than its median in recent passing runs is logged as a
+    warning and listed under ``slow_tasks`` in the report. Slowness does not fail the run:
+    wall-clock time depends on the machine's load, and data that passed the gate is still correct.
     Every task overwrites its own output, so repeating one is safe. A failed quality gate is never
     retried because running the same checks again cannot change the outcome, and neither is a raw
     CSV whose header breaks its column contract (:class:`RawContractError`), which stops the run
@@ -180,7 +219,6 @@ def run_pipeline(
             report_path=paths.reports / f"run_{batch_id}.json",
         )
         write_report(result)
-        append_run(paths, batch_id, row_counts, rates, all(c.passed for c in result.checks))
         state["result"] = result
         assert_all_passed(result.checks)
 
@@ -213,10 +251,10 @@ def run_pipeline(
         )
     finally:
         # The quality task writes the report before publish runs, so rewrite it with the timing
-        # of every task that ran, including a failed gate or a failed publish.
+        # of every task that ran, including a failed gate or a failed publish, then record the
+        # run in the history once every task time is known.
         if "result" in state:
-            state["result"] = replace(state["result"], task_runs=list(task_runs))
-            write_report(state["result"])
+            _finish_run(paths, state, task_runs)
     result = replace(state["result"], task_attempts=attempts)
     logger.info("Run %s finished; report at %s", batch_id, result.report_path)
     return result

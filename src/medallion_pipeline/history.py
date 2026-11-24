@@ -1,11 +1,15 @@
-"""Run history: one JSON line per run, used to spot rejection rates that drift from normal.
+"""Run history: one JSON line per run, used to spot rejection rates and task times that drift.
 
 The absolute limit in the quality gate catches a broken delivery. The history catches a quieter
 problem: a rate that is still under the limit but far above what this pipeline usually produces.
+It also keeps how long each task took, so a layer that suddenly runs much slower than usual is
+flagged in the run report instead of only being visible to someone comparing reports by hand.
 """
 
 import json
 import statistics
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +20,8 @@ HISTORY_FILE = "run_history.jsonl"
 MIN_HISTORY_RUNS = 3  # fewer prior runs make a baseline too noisy to judge against
 HISTORY_WINDOW = 20
 DEFAULT_TREND_MARGIN = 0.05  # allowed increase over the median of earlier runs
+DEFAULT_SLOWDOWN_FACTOR = 2.0  # a task this many times slower than its median is flagged
+MIN_SLOWDOWN_SECONDS = 5.0  # ...but only if it is also this much slower, so tiny tasks stay quiet
 
 
 def history_path(paths: LakePaths) -> Path:
@@ -42,8 +48,12 @@ def append_run(
     row_counts: dict[str, int],
     rates: dict[str, float],
     passed: bool,
+    task_seconds: dict[str, float] | None = None,
 ) -> None:
-    """Record a run, replacing an earlier entry for the same batch so replays stay idempotent."""
+    """Record a run, replacing an earlier entry for the same batch so replays stay idempotent.
+
+    ``task_seconds`` maps each task that succeeded to the seconds its attempts took.
+    """
     runs = [run for run in read_history(paths) if run.get("batch_id") != batch_id]
     runs.append(
         {
@@ -52,6 +62,7 @@ def append_run(
             "passed": passed,
             "row_counts": row_counts,
             "batch_rejection_rates": rates,
+            "task_seconds": task_seconds or {},
         }
     )
     path = history_path(paths)
@@ -98,3 +109,78 @@ def check_rejection_trend(
             )
         )
     return results
+
+
+@dataclass(frozen=True)
+class SlowTask:
+    """A task that took much longer than it usually does in passing runs."""
+
+    name: str
+    seconds: float
+    median_seconds: float
+    baseline_runs: int
+
+    def as_dict(self) -> dict[str, str | int | float]:
+        return {
+            "name": self.name,
+            "seconds": round(self.seconds, 3),
+            "median_seconds": round(self.median_seconds, 3),
+            "baseline_runs": self.baseline_runs,
+        }
+
+
+def find_slow_tasks(
+    task_seconds: dict[str, float],
+    history: list[dict],
+    factor: float = DEFAULT_SLOWDOWN_FACTOR,
+    min_seconds: float = MIN_SLOWDOWN_SECONDS,
+) -> list[SlowTask]:
+    """Return the tasks that took more than ``factor`` times their median in recent passing runs.
+
+    A task must also be at least ``min_seconds`` slower than its median, because a task that
+    normally takes a fraction of a second doubles from noise alone. Runs recorded before task
+    times were kept, and tasks with fewer than ``MIN_HISTORY_RUNS`` timings, are not judged.
+    """
+    if factor < 1:
+        raise ValueError(f"factor must be at least 1, got {factor}")
+    if min_seconds < 0:
+        raise ValueError(f"min_seconds must not be negative, got {min_seconds}")
+    baseline = [run for run in history if run.get("passed")][-HISTORY_WINDOW:]
+    slow = []
+    for name, seconds in task_seconds.items():
+        past = [
+            run["task_seconds"][name] for run in baseline if name in run.get("task_seconds", {})
+        ]
+        if len(past) < MIN_HISTORY_RUNS:
+            continue
+        typical = statistics.median(past)
+        if seconds > typical * factor and seconds - typical >= min_seconds:
+            slow.append(SlowTask(name, seconds, typical, len(past)))
+    return slow
+
+
+def format_history(runs: Sequence[dict], last: int | None = None) -> str:
+    """Render recorded runs, newest last, as a plain-text table for the ``history`` command."""
+    shown = list(runs[-last:] if last else runs)
+    header = ("batch_id", "recorded_at", "gate", "total_s", "max_rejection", "slowest_task")
+    rows = [header]
+    for run in shown:
+        seconds = run.get("task_seconds") or {}
+        rates = run.get("batch_rejection_rates") or {}
+        worst = max(rates.items(), key=lambda item: item[1], default=None)
+        slowest = max(seconds.items(), key=lambda item: item[1], default=None)
+        rows.append(
+            (
+                str(run.get("batch_id", "?")),
+                str(run.get("recorded_at", "?")),
+                "passed" if run.get("passed") else "failed",
+                f"{sum(seconds.values()):.1f}" if seconds else "-",
+                f"{worst[0]} {worst[1]:.2%}" if worst else "-",
+                f"{slowest[0]} {slowest[1]:.1f}s" if slowest else "-",
+            )
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
+        for row in rows
+    )

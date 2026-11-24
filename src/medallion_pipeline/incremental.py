@@ -8,6 +8,10 @@ Merge rules mirror a full rebuild: the newest ``updated_at`` wins for customers 
 late, older record never overwrites a newer one), the newest ingestion wins for orders, and the
 lines of a re-delivered order replace its previous lines. An order whose newest version has no
 valid line leaves Silver for quarantine.
+
+Late-arriving dimensions are handled too: an order quarantined earlier because its customer was
+unknown, or because one of its lines named an unknown product, is re-evaluated from Bronze once
+that customer or product has arrived, as a full rebuild would do.
 """
 
 import json
@@ -18,6 +22,7 @@ from pyspark.sql import functions as F
 
 from medallion_pipeline.config import ENTITIES, LakePaths
 from medallion_pipeline.silver import (
+    REJECTION_REASONS,
     SilverTables,
     clean_customers,
     clean_order_items,
@@ -65,6 +70,29 @@ def read_silver(spark: SparkSession, paths: LakePaths) -> SilverTables:
     )
 
 
+def late_arriving_orders(
+    quarantine: dict[str, DataFrame], customers: DataFrame, products: DataFrame
+) -> DataFrame:
+    """Order IDs whose quarantine may be stale because a missing dimension row has arrived.
+
+    These are orders quarantined for ``known_customer`` whose customer is now in Silver, and
+    orders with a line quarantined for ``known_product`` whose product is now in Silver.
+    """
+    by_customer = (
+        quarantine["orders"]
+        .filter(F.array_contains(REJECTION_REASONS, "known_customer"))
+        .join(customers.select("customer_id"), "customer_id", "left_semi")
+        .select("order_id")
+    )
+    by_product = (
+        quarantine["order_items"]
+        .filter(F.array_contains(REJECTION_REASONS, "known_product"))
+        .join(products.select("product_id"), "product_id", "left_semi")
+        .select("order_id")
+    )
+    return by_customer.unionByName(by_product).filter(F.col("order_id").isNotNull()).distinct()
+
+
 def merge_silver(
     existing: SilverTables, bronze: dict[str, DataFrame], new_batches: set[str]
 ) -> SilverTables:
@@ -86,13 +114,24 @@ def merge_silver(
         F.col("_ingested_at").desc(),
     )
 
-    orders_new = clean_orders(delta["orders"], customers)
+    # Every Bronze version of a late-arriving order is cleaned again, so the newest one wins
+    # exactly as in a full rebuild. Their earlier Silver rows and quarantine rows are replaced.
+    late = late_arriving_orders(existing.quarantine, customers, products)
+    late_bronze = (
+        bronze["orders"]
+        .filter(~F.col("_batch_id").isin(*new_batches))
+        .join(late, F.trim(bronze["orders"]["order_id"]) == late["order_id"], "left_semi")
+    )
+
+    orders_new = clean_orders(delta["orders"].unionByName(late_bronze), customers)
     items_new = clean_order_items(orders_new.valid, products)
     emptied_new = split_orders_without_valid_items(orders_new.valid, items_new.valid).rejected
     # An emptied order still competes for "newest version" like a full rebuild does: when it
     # wins, the order leaves Silver instead of falling back to an older version.
     orders = keep_latest(
-        existing.orders.unionByName(orders_new.valid.drop("items")),
+        existing.orders.join(late, "order_id", "left_anti").unionByName(
+            orders_new.valid.drop("items")
+        ),
         "order_id",
         F.col("_ingested_at").desc(),
     ).join(
@@ -101,8 +140,10 @@ def merge_silver(
         "left_anti",
     )
     redelivered = orders_new.valid.select("order_id").distinct()
-    items = existing.order_items.join(redelivered, "order_id", "left_anti").unionByName(
-        items_new.valid
+    items = (
+        existing.order_items.join(redelivered, "order_id", "left_anti")
+        .join(late, "order_id", "left_anti")
+        .unionByName(items_new.valid)
     )
 
     rejected_new = {
@@ -111,13 +152,15 @@ def merge_silver(
         "orders": orders_new.rejected.unionByName(emptied_new, allowMissingColumns=True),
         "order_items": items_new.rejected,
     }
-    # Replaying a batch must not duplicate its quarantined rows.
-    quarantine = {
-        name: existing.quarantine[name]
-        .filter(~F.col("_batch_id").isin(*new_batches))
-        .unionByName(rejected_new[name])
+    # Replaying a batch must not duplicate its quarantined rows, and the old quarantine rows of
+    # a re-evaluated order are replaced by the outcome of its new evaluation.
+    kept = {
+        name: existing.quarantine[name].filter(~F.col("_batch_id").isin(*new_batches))
         for name in ENTITIES
     }
+    for name in ("orders", "order_items"):
+        kept[name] = kept[name].join(late, "order_id", "left_anti")
+    quarantine = {name: kept[name].unionByName(rejected_new[name]) for name in ENTITIES}
     return SilverTables(
         customers=customers,
         products=products,

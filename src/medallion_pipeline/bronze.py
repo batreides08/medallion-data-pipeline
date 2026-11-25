@@ -12,7 +12,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 
 from medallion_pipeline.config import LakePaths
-from medallion_pipeline.contracts import validate_csv_headers
+from medallion_pipeline.contracts import check_csv_header, check_jsonl_keys, raise_on_failures
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +28,12 @@ CUSTOMERS_SCHEMA = StructType(
     _strings("customer_id", "full_name", "email", "country", "updated_at")
 )
 PRODUCTS_SCHEMA = StructType(_strings("product_id", "name", "category", "list_price", "updated_at"))
+ORDER_KEYS = ("order_id", "customer_id", "status", "order_ts", "items")
+ORDER_ITEM_KEYS = ("product_id", "quantity", "unit_price")
 ORDERS_SCHEMA = StructType(
     [
-        *_strings("order_id", "customer_id", "status", "order_ts"),
-        StructField(
-            "items", ArrayType(StructType(_strings("product_id", "quantity", "unit_price")))
-        ),
+        *_strings(*ORDER_KEYS[:-1]),
+        StructField("items", ArrayType(StructType(_strings(*ORDER_ITEM_KEYS)))),
         StructField(CORRUPT_RECORD, StringType()),
     ]
 )
@@ -61,20 +61,28 @@ def _read_csv(spark: SparkSession, path: Path, schema: StructType) -> DataFrame:
 def read_raw(spark: SparkSession, paths: LakePaths, batch_id: str) -> dict[str, DataFrame]:
     """Read the raw files of one delivery, tagged with lineage columns.
 
-    CSV headers are checked first: a missing or duplicated required column raises
-    :class:`~medallion_pipeline.contracts.RawContractError` before anything is written.
+    Every file is checked first: a CSV header missing or repeating a required column, or a JSONL
+    feed in which no order uses a required key, raises
+    :class:`~medallion_pipeline.contracts.RawContractError` before anything is written. All broken
+    files are listed in one error.
     """
     csv_files = {
         paths.raw / "customers.csv": CUSTOMERS_SCHEMA,
         paths.raw / "products.csv": PRODUCTS_SCHEMA,
     }
-    checks = validate_csv_headers({path: s.fieldNames() for path, s in csv_files.items()})
+    orders_file = paths.raw / "orders.jsonl"
+    checks = raise_on_failures(
+        [
+            *(check_csv_header(path, s.fieldNames()) for path, s in csv_files.items()),
+            check_jsonl_keys(orders_file, ORDER_KEYS, {"items": ORDER_ITEM_KEYS}),
+        ]
+    )
     for check in checks:
         if check.extra:
-            logger.warning("Ignoring columns not in the contract: %s", check.describe())
+            logger.warning("Ignoring fields not in the contract: %s", check.describe())
     customers, products = (_read_csv(spark, path, s) for path, s in csv_files.items())
     orders = spark.read.schema(ORDERS_SCHEMA).json(
-        (paths.raw / "orders.jsonl").as_posix(),
+        orders_file.as_posix(),
         mode="PERMISSIVE",
         columnNameOfCorruptRecord=CORRUPT_RECORD,
     )

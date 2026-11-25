@@ -54,7 +54,12 @@ flowchart TD
 - CSV columns are matched by header name, not position (`contracts.py`). Names must match exactly;
   order does not matter. A missing or duplicated required column raises `RawContractError` before
   anything is written, and the run is not retried because the file will not change. Extra columns
-  are logged and dropped. JSON orders are already matched by field name.
+  are logged and dropped.
+- JSON orders are matched by field name, but Spark fills a field it cannot find with NULL. The
+  contract therefore checks which keys the orders use, at the top level and inside `items`. A key
+  that no well-formed order uses (for example `order_ts` delivered as `orderTs`) raises the same
+  `RawContractError`; a key missing from only some orders is a row defect left to Silver's
+  quarantine. Unknown keys are logged and dropped. All broken files are reported in one error.
 - Malformed JSON is kept in `_corrupt_record`.
 - Each row carries `_source_file`, `_ingested_at` and `_batch_id`.
 - Data is partitioned by `_batch_id`. Overwriting is dynamic, so re-running a batch replaces only

@@ -46,11 +46,14 @@ Design decisions and the data model are in [docs/architecture.md](docs/architect
   Silver; a test checks the result equals a full rebuild. Orders quarantined because their
   customer or product had not arrived yet are re-evaluated once it does, so late-arriving
   dimensions are not lost in incremental mode.
-- **Column contracts on raw CSV files.** Spark maps CSV columns to a schema by position and only
+- **Column contracts on raw files.** Spark maps CSV columns to a schema by position and only
   logs a warning when the header disagrees, so a delivery with reordered columns would silently put
   emails in `full_name`. Bronze checks each header first and then reads columns by name: reordered
   columns are mapped correctly, extra ones are logged and ignored, and a missing or duplicated
-  required column stops the run (exit code 1) before Bronze is written, without retries.
+  required column stops the run (exit code 1) before Bronze is written, without retries. The JSONL
+  orders feed gets the same protection: Spark fills a key it cannot find with NULL, so a key that
+  no order uses (such as `order_ts` renamed to `orderTs`, checked inside `items` too) stops the run
+  with the field named, instead of quarantining the whole batch under a misleading reason.
 - **A quality gate that can stop a run.** It checks primary keys, required fields and references
   between tables, and reconciles revenue across every Gold mart to the cent. The report is written
   even when the gate fails.
@@ -168,7 +171,7 @@ $env:JAVA_TOOL_OPTIONS = '-Djdk.net.unixdomain.tmpdir=C:\Windows\Temp'
 ```text
 src/medallion_pipeline/
 ├── data_generator.py   Seeded raw data with known defects
-├── contracts.py        Column contracts checked on raw CSV headers
+├── contracts.py        Contracts on raw CSV headers and JSONL keys
 ├── bronze.py           Raw ingestion with lineage
 ├── silver.py           Typing, validation, deduplication, quarantine
 ├── scd2.py             Customer history (dim_customer) and point-in-time order join
